@@ -1,0 +1,28 @@
+{
+  "name": "ocr-smart-scanner-mobile",
+  "version": "1.0.0",
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web"
+  },
+  "dependencies": {
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "expo": "~58.0.22",
+    "expo-camera": "~58.0.14",
+    "expo-file-system": "~58.0.13",
+    "expo-image-manipulator": "~58.0.16",
+    "expo-sensors": "~58.0.4",
+    "expo-sharing": "~58.0.21",
+    "expo-status-bar": "~58.0.4",
+    "react": "19.3.0",
+    "react-native": "0.88.1"
+  },
+  "devDependencies": {
+    "@types/react": "~19.3.0",
+    "typescript": "~6.0.3"
+  },
+  "private": true
+}

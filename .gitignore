@@ -1,0 +1,40 @@
+# Python / Backend
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+backend/.venv/
+.venv/
+venv/
+ENV/
+.pytest_cache/
+*.db
+*.sqlite3
+backend/uploads/
+uploads/
+
+# Node / Expo / React Native
+mobile/node_modules/
+node_modules/
+mobile/.expo/
+.expo/
+dist/
+web-build/
+npm-debug.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+
+# Environment & OS
+.env
+.env.local
+.DS_Store
+Thumbs.db
+*.log
+
+# Unused Chinese OCR model
+backend/app/ocr_models/ch_PP-OCRv4_rec_infer.onnx

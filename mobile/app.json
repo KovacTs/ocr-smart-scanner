@@ -1,0 +1,17 @@
+{
+  "expo": {
+    "name": "Smart OCR Scanner",
+    "slug": "ocr-smart-scanner",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Permitir acceso a la cámara para escanear documentos con enfoque asistido."
+        }
+      ]
+    ]
+  }
+}
