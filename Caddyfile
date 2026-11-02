@@ -1,0 +1,27 @@
+{
+    # Habilitar logs formateados
+    log {
+        output stdout
+        format console
+    }
+}
+
+# Variable de entorno DOMAIN (ej: ocr.tudominio.com o tu-subdominio.duckdns.org)
+# Si no defines DOMAIN, Caddy escuchará en HTTP (:80) por defecto.
+{$DOMAIN::80} {
+    # Proxy inverso hacia el servicio FastAPI
+    reverse_proxy backend:8000 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # Límite de tamaño de subida de imágenes (máximo 25 MB)
+    request_body {
+        max_size 25MB
+    }
+
+    # Compresión gzip/zstd al vuelo para respuestas JSON y texto
+    encode zstd gzip
+}

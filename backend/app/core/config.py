@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL", f"sqlite:///{BASE_DIR / 'ocr_scanner.db'}"
     )
-    UPLOADS_DIR: Path = BASE_DIR / "uploads"
+    UPLOADS_DIR: Path = Path(os.getenv("UPLOADS_DIR", str(BASE_DIR / "uploads")))
 
     # Parámetros del Pipeline de Enfoque y WebP
     BLUR_THRESHOLD_DEFAULT: float = 380.0
@@ -45,3 +45,7 @@ class Settings(BaseSettings):
 
 settings = Settings()
 settings.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+if settings.DATABASE_URL.startswith("sqlite:///"):
+    db_raw_path = settings.DATABASE_URL.replace("sqlite:///", "")
+    Path(db_raw_path).parent.mkdir(parents=True, exist_ok=True)
