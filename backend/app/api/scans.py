@@ -33,6 +33,11 @@ from app.services.ocr_normalizer import (
     extract_raw_text_from_image,
     normalize_document_text,
 )
+from app.services.sii_barcode_service import (
+    decode_barcodes_from_image,
+    merge_sii_ted_with_ocr,
+    parse_sii_ted_xml,
+)
 from app.services.vision_service import analyze_focus_and_roi, optimize_and_save_webp
 
 router = APIRouter(prefix="/scans", tags=["Escaneos, Enfoque, Normalización y Excel"])
@@ -59,6 +64,7 @@ async def evaluate_camera_focus(
 async def create_scan(
     file: UploadFile = File(...),
     raw_text_hint: Optional[str] = Form(default=None),
+    sii_ted_xml: Optional[str] = Form(default=None),
     force_capture: bool = Form(default=False),
     blur_threshold: Optional[float] = Form(default=None),
     current_user: User = Depends(get_current_user),
@@ -66,15 +72,17 @@ async def create_scan(
 ):
     """
     Pipeline completo de captura de documento:
-    1. Valida el nivel de enfoque de la imagen (rechaza fotos borrosas salvo force_capture=True).
+    1. Valida el nivel de enfoque de la imagen (rechaza fotos borrosas salvo force_capture=True o Timbre SII leído).
     2. Normaliza resolución (máx 2400px) y comprime a WebP (82% calidad) + Miniatura WebP (400px).
-    3. Ejecuta OCR y el motor de limpieza de ruido / normalización de facturas y boletas.
-    4. Guarda el escaneo y registra la Versión #1 en el historial del usuario.
+    3. Decodifica Timbre Electrónico SII (PDF417 <TED>) desde cliente o desde la imagen con zxing-cpp.
+    4. Ejecuta OCR visual y fusiona con prioridad criptográfica del Timbre SII.
+    5. Guarda el escaneo y registra la Versión #1 en el historial del usuario.
     """
     image_bytes = await file.read()
     focus_info = analyze_focus_and_roi(image_bytes, threshold=blur_threshold)
+    ted_from_client = parse_sii_ted_xml(sii_ted_xml) if sii_ted_xml else None
 
-    if not force_capture and not focus_info["is_focused"]:
+    if not force_capture and not focus_info["is_focused"] and ted_from_client is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
@@ -94,11 +102,26 @@ async def create_scan(
         scan_id=scan_id,
     )
 
+    ted_data = ted_from_client or decode_barcodes_from_image(
+        storage_info["main_disk_path"]
+    )
+
     raw_text = extract_raw_text_from_image(
         image_path=storage_info["main_disk_path"],
         raw_text_hint=raw_text_hint,
     )
-    normalized_data = normalize_document_text(raw_text)
+    ocr_normalized = normalize_document_text(raw_text)
+    normalized_data = merge_sii_ted_with_ocr(ted_data, ocr_normalized)
+
+    if ted_data and ted_data.get("source") == "SII_TED_PDF417":
+        ted_header = (
+            f"[TIMBRE SII PDF417 VERIFICADO] "
+            f"RUT: {normalized_data['issuer']['tax_id']} | "
+            f"Comercio: {normalized_data['issuer']['legal_name']} | "
+            f"Folio: {normalized_data['document_number']} | "
+            f"Total: ${int(normalized_data['amounts']['total_amount'])}"
+        )
+        raw_text = f"{ted_header}\n{raw_text}".strip()
 
     amounts = normalized_data.get("amounts", {})
     total_amount = float(amounts.get("total_amount", 0.0) or 0.0)
@@ -125,7 +148,11 @@ async def create_scan(
         version_number=1,
         raw_text=raw_text,
         normalized_data=normalized_data,
-        modified_by="OCR_AUTOMATIC",
+        modified_by=(
+            "SII_TED_PDF417"
+            if (ted_data and ted_data.get("source") == "SII_TED_PDF417")
+            else "OCR_AUTOMATIC"
+        ),
     )
     db.add(version_1)
     db.commit()

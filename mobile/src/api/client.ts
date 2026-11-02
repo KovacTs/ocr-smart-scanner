@@ -83,13 +83,17 @@ export const apiClient = {
   async uploadScanWebP(
     token: string,
     rawPhotoUri: string,
-    forceCapture = false
+    forceCapture = false,
+    siiTedXml?: string
   ): Promise<ScanItem> {
     const compressed = await compressToWebPClientSide(rawPhotoUri);
     const formData = new FormData();
     const webpFile = new File(compressed.uri);
     formData.append('file', webpFile);
     formData.append('force_capture', String(forceCapture));
+    if (siiTedXml && siiTedXml.trim()) {
+      formData.append('sii_ted_xml', siiTedXml.trim());
+    }
 
     const res = await fetch(`${API_BASE_URL}/scans`, {
       method: 'POST',

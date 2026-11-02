@@ -49,6 +49,7 @@ export const SmartCameraScreen: React.FC<Props> = ({
   const [stableTicks, setStableTicks] = useState<number>(0);
   const [isProcessingUpload, setIsProcessingUpload] = useState<boolean>(false);
   const [showForceButton, setShowForceButton] = useState<boolean>(false);
+  const [detectedTedLabel, setDetectedTedLabel] = useState<string | null>(null);
 
   const stableTicksRef = useRef<number>(0);
   const isCapturingRef = useRef<boolean>(false);
@@ -56,10 +57,39 @@ export const SmartCameraScreen: React.FC<Props> = ({
   const cooldownUntilRef = useRef<number>(0);
   const lastGyroMagnitudeRef = useRef<number>(0);
   const autoCaptureRef = useRef<boolean>(autoCapture);
+  const detectedTedXmlRef = useRef<string>('');
 
   useEffect(() => {
     autoCaptureRef.current = autoCapture;
   }, [autoCapture]);
+
+  /**
+   * Detecta en vivo el Timbre Electrónico SII (PDF417 <TED>) o código de barras SII de 30-31 dígitos
+   */
+  const handleBarcodeScanned = useCallback(
+    (result: { type: string; data: string }) => {
+      const raw = (result?.data || '').trim();
+      if (!raw || detectedTedXmlRef.current === raw) return;
+
+      const upper = raw.toUpperCase();
+      if (
+        upper.includes('<TED') ||
+        (upper.includes('<DD') && upper.includes('<RE>') && upper.includes('<F>'))
+      ) {
+        detectedTedXmlRef.current = raw;
+        const mFolio = raw.match(/<F>([^<]+)<\/F>/i);
+        const mRs = raw.match(/<RS>([^<]+)<\/RS>/i);
+        const folioTxt = mFolio ? mFolio[1].trim() : 'OK';
+        const rsTxt = mRs ? mRs[1].trim().slice(0, 22) : 'SII';
+        setDetectedTedLabel(`✓ Timbre SII PDF417: Folio #${folioTxt} (${rsTxt})`);
+      } else if (/^20\d{6}\d{11,12}\d{10}\d$/.test(raw)) {
+        detectedTedXmlRef.current = raw;
+        const folio10 = raw.slice(-11, -1);
+        setDetectedTedLabel(`✓ Código SII Detectado: Folio #${folio10}`);
+      }
+    },
+    []
+  );
 
   /**
    * Fuerza al motor físico del lente de la cámara a re-escanear la distancia focal
@@ -90,7 +120,11 @@ export const SmartCameraScreen: React.FC<Props> = ({
       isCapturingRef.current = true;
       setIsProcessingUpload(true);
       setStatusColor('GREEN');
-      setHudMessage('Mejorando contraste CLAHE y ejecutando OCR neuronal...');
+      setHudMessage(
+        detectedTedXmlRef.current
+          ? 'Procesando Timbre SII Criptográfico + Imagen WebP...'
+          : 'Mejorando contraste CLAHE y ejecutando OCR neuronal...'
+      );
 
       try {
         const photo = await cameraRef.current.takePictureAsync({
@@ -105,7 +139,8 @@ export const SmartCameraScreen: React.FC<Props> = ({
         const savedScan = await apiClient.uploadScanWebP(
           token,
           photo.uri,
-          forceCapture
+          forceCapture,
+          detectedTedXmlRef.current || undefined
         );
         setShowForceButton(false);
         onScanCompleted(savedScan);
@@ -180,17 +215,21 @@ export const SmartCameraScreen: React.FC<Props> = ({
         return;
       }
 
+      const requiredTicks = detectedTedXmlRef.current
+        ? 3
+        : STABILITY_TICKS_REQUIRED;
+
       const nextTicks = Math.min(
-        STABILITY_TICKS_REQUIRED,
+        requiredTicks,
         stableTicksRef.current + 1
       );
       stableTicksRef.current = nextTicks;
       setStableTicks(nextTicks);
 
-      if (nextTicks < STABILITY_TICKS_REQUIRED) {
+      if (nextTicks < requiredTicks) {
         setStatusColor('GREEN');
         setHudMessage(
-          `Enfocando caracteres (${nextTicks}/${STABILITY_TICKS_REQUIRED})...`
+          `Enfocando caracteres (${nextTicks}/${requiredTicks})...`
         );
       } else {
         setStatusColor('GREEN');
@@ -240,6 +279,10 @@ export const SmartCameraScreen: React.FC<Props> = ({
         zoom={zoom}
         enableTorch={torchOn}
         animateShutter={false}
+        barcodeScannerSettings={{
+          barcodeTypes: ['pdf417', 'qr', 'code128'],
+        }}
+        onBarcodeScanned={handleBarcodeScanned}
         onCameraReady={() => {
           isCameraReadyRef.current = true;
         }}
@@ -284,6 +327,11 @@ export const SmartCameraScreen: React.FC<Props> = ({
           <View style={[styles.statusPill, { backgroundColor: borderColor }]}>
             <Text style={styles.statusPillText}>{hudMessage}</Text>
           </View>
+          {detectedTedLabel && (
+            <View style={styles.tedBadge}>
+              <Text style={styles.tedBadgeText}>{detectedTedLabel}</Text>
+            </View>
+          )}
         </View>
       </TouchableOpacity>
 
@@ -451,6 +499,22 @@ const styles = StyleSheet.create({
   },
   statusPillText: {
     color: '#0F172A',
+    fontWeight: '800',
+    fontSize: 12,
+    textAlign: 'center',
+  },
+  tedBadge: {
+    marginTop: 8,
+    backgroundColor: 'rgba(16, 185, 129, 0.95)',
+    borderWidth: 1,
+    borderColor: '#A7F3D0',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    marginHorizontal: 10,
+  },
+  tedBadgeText: {
+    color: '#064E3B',
     fontWeight: '800',
     fontSize: 12,
     textAlign: 'center',

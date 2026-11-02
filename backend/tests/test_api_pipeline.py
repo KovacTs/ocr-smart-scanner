@@ -216,3 +216,75 @@ def test_full_smart_ocr_pipeline():
     assert ws.cell(row=2, column=4).value == "76.543.210-K"
     assert ws.cell(row=2, column=10).value == 595000.0
     assert str(ws.cell(row=3, column=10).value).startswith("=SUM(")
+
+
+def test_sii_ted_pdf417_xml_extraction_and_fusion():
+    """
+    Valida que al decodificar un Timbre Electrónico SII (<TED> PDF417) en una Boleta Electrónica (TD=39)
+    o Factura (TD=33), el sistema extraiga con 100% de exactitud el Folio, RUT Emisor, Razón Social,
+    Fecha ISO y Montos, fusionándose con la dirección detectada por el OCR visual.
+    """
+    login_res = client.post(
+        "/api/auth/login",
+        json={"email": "auditor@empresa.cl", "password": "PasswordSeguro123!"},
+    )
+    assert login_res.status_code == 200
+    token = login_res.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    sample_ted_xml = """
+    <TED version="1.0">
+      <DD>
+        <RE>76134941-4</RE>
+        <TD>39</TD>
+        <F>002640601308</F>
+        <FE>2026-11-02</FE>
+        <RR>66666666-6</RR>
+        <RSR>BOLETA</RSR>
+        <MNT>42241</MNT>
+        <IT1>LECHE ENTERA</IT1>
+        <CAF version="1.0">
+          <DA>
+            <RE>76134941-4</RE>
+            <RS>HIPER LIMITADA</RS>
+            <TD>39</TD>
+          </DA>
+        </CAF>
+      </DD>
+    </TED>
+    """
+
+    partial_ocr_text = (
+        "SUC: AV. Vicuna Mackenna 3361\n"
+        "TOTAL AFECTO $ 35.497\n"
+        "TOTAL IVA (19.0%) $ 6.744\n"
+        "TOTAL $ 42.241"
+    )
+
+    sharp_bytes = generate_synthetic_document_image(blurry=False, high_res=False)
+    scan_res = client.post(
+        "/api/scans",
+        headers=headers,
+        files={"file": ("boleta_lider.jpg", sharp_bytes, "image/jpeg")},
+        data={
+            "raw_text_hint": partial_ocr_text,
+            "sii_ted_xml": sample_ted_xml,
+        },
+    )
+    assert scan_res.status_code == 201
+    scan_json = scan_res.json()
+
+    assert scan_json["document_type"] == "BOLETA_ELECTRONICA"
+    assert scan_json["folio"] == "002640601308"
+    assert scan_json["issue_date"] == "2026-11-02"
+    assert scan_json["total_amount"] == 42241.0
+
+    norm = scan_json["current_normalized_data"]
+    assert norm["issuer"]["tax_id"] == "76.134.941-4"
+    assert norm["issuer"]["legal_name"] == "HIPER LIMITADA (LIDER)"
+    assert "Vicuna Mackenna 3361" in norm["issuer"]["address"]
+    assert norm["amounts"]["net_amount"] == 35497.0
+    assert norm["amounts"]["tax_amount"] == 6744.0
+    assert norm["confidence_score"] == 1.0
+    assert scan_json["versions"][0]["modified_by"] == "SII_TED_PDF417"
+
