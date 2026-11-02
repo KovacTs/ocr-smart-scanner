@@ -444,7 +444,11 @@ def _clean_candidate_issuer_line(line: str) -> str:
     return cleaned
 
 
-def normalize_document_text(raw_text: str) -> dict[str, Any]:
+def normalize_document_text(
+    raw_text: str,
+    image_path: Optional[str] = None,
+    use_llm_fallback: bool = True,
+) -> dict[str, Any]:
     """
     Ejecuta el pipeline completo de normalización sobre el texto extraído por el OCR:
     1. Descarta ruido de impresión térmica y leyendas legales.
@@ -452,6 +456,7 @@ def normalize_document_text(raw_text: str) -> dict[str, Any]:
     3. Extrae Folio (incluyendo abreviaciones 'Bol. Electronica' y respaldo de timbre SII de 31 dígitos).
     4. Extrae RUT Emisor/Receptor validado en Módulo 11, Razón Social (con separación en la misma línea
        y enriquecimiento de comercios chilenos) y Montos (incluyendo 'TOTAL AFECTO' / 'EXENTO').
+    5. Si falta algún campo crítico o la confianza es baja, invoca al Extractor Semántico LLM/VLM (Hito 2).
     """
     lines = clean_ocr_noise(raw_text)
     clean_text = "\n".join(lines)
@@ -738,7 +743,7 @@ def normalize_document_text(raw_text: str) -> dict[str, Any]:
     ]
     confidence_score = round(0.55 + (sum(checks) / len(checks)) * 0.43, 2)
 
-    return {
+    result: dict[str, Any] = {
         "document_type": doc_type,
         "document_number": folio or "S/N",
         "issue_date": issue_date,
@@ -761,3 +766,14 @@ def normalize_document_text(raw_text: str) -> dict[str, Any]:
         },
         "confidence_score": confidence_score,
     }
+
+    if use_llm_fallback:
+        from app.services.llm_extractor_service import refine_normalization_with_llm
+
+        result = refine_normalization_with_llm(
+            raw_text=raw_text,
+            heuristic_data=result,
+            image_path=image_path,
+        )
+
+    return result

@@ -28,6 +28,14 @@ class Settings(BaseSettings):
     THUMBNAIL_WIDTH: int = 400
     THUMBNAIL_QUALITY: int = 70
 
+    # Parámetros del Extractor Semántico LLM / VLM (Hito 2: Ollama Local / Gemini Cloud)
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "AUTO")  # AUTO | OLLAMA | GEMINI | DISABLED
+    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    LLM_TIMEOUT_SECONDS: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "4.5"))
+
 
 settings = Settings()
 settings.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)

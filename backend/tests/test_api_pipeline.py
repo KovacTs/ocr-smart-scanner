@@ -288,3 +288,78 @@ def test_sii_ted_pdf417_xml_extraction_and_fusion():
     assert norm["confidence_score"] == 1.0
     assert scan_json["versions"][0]["modified_by"] == "SII_TED_PDF417"
 
+
+def test_llm_semantic_refinement_and_sanitization(monkeypatch):
+    """
+    Valida que cuando una boleta no tiene Timbre PDF417 visible y el texto OCR tiene etiquetas
+    truncadas por reflejo de luz (ej. falta la palabra 'Bol. Electronica'), el orquestador LLM
+    (Ollama Local / Gemini Flash) refine el JSON, rescate el Folio y el Comercio, y proteja
+    los RUTs validados en Módulo 11.
+    """
+    from app.services import llm_extractor_service
+
+    def fake_llm_extractor(raw_text: str, image_path=None):
+        return {
+            "_provider": "OLLAMA (qwen2.5:3b)",
+            "document_type": "BOLETA_ELECTRONICA",
+            "document_number": "002640601308",
+            "issue_date": "2026-11-02",
+            "issuer": {
+                "tax_id": "76.134.941-9",  # DV inválido simulado: debe conservarse el 76.134.941-4 válido
+                "legal_name": "HIPER LIMITADA (LIDER)",
+                "address": "AV. Vicuna Mackenna 3361, San Joaquin",
+            },
+            "receiver": {
+                "tax_id": "",
+                "legal_name": "CLIENTE GENERAL",
+            },
+            "amounts": {
+                "net_amount": 35497,
+                "tax_amount": 6744,
+                "exempt_amount": 0,
+                "total_amount": 42241,
+                "currency": "CLP",
+            },
+        }
+
+    monkeypatch.setattr(
+        llm_extractor_service, "extract_structured_data_with_llm", fake_llm_extractor
+    )
+
+    login_res = client.post(
+        "/api/auth/login",
+        json={"email": "auditor@empresa.cl", "password": "PasswordSeguro123!"},
+    )
+    assert login_res.status_code == 200
+    token = login_res.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Texto con el encabezado 'Bol. Electronica' borrado por brillo especular
+    damaged_ocr_text = (
+        "HIPER LIMITADA  RUT: 76.134.941-4\n"
+        "002640601308 Caja: 0014  Fecha: 02/11/2026\n"
+        "LECHE ENTERA  $ 2.000\n"
+        "TOTAL $ 42.241"
+    )
+
+    sharp_bytes = generate_synthetic_document_image(blurry=False, high_res=False)
+    scan_res = client.post(
+        "/api/scans",
+        headers=headers,
+        files={"file": ("boleta_sin_timbre.jpg", sharp_bytes, "image/jpeg")},
+        data={"raw_text_hint": damaged_ocr_text},
+    )
+    assert scan_res.status_code == 201
+    scan_json = scan_res.json()
+
+    assert scan_json["document_type"] == "BOLETA_ELECTRONICA"
+    assert scan_json["folio"] == "002640601308"
+    assert scan_json["total_amount"] == 42241.0
+
+    norm = scan_json["current_normalized_data"]
+    assert norm["issuer"]["tax_id"] == "76.134.941-4"  # Protegido por validación Módulo 11
+    assert norm["issuer"]["legal_name"] == "HIPER LIMITADA (LIDER)"
+    assert norm["llm_refined"] is True
+    assert scan_json["versions"][0]["modified_by"] == "OCR_LLM_HYBRID"
+
+

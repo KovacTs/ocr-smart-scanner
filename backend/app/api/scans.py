@@ -110,10 +110,15 @@ async def create_scan(
         image_path=storage_info["main_disk_path"],
         raw_text_hint=raw_text_hint,
     )
-    ocr_normalized = normalize_document_text(raw_text)
+    has_full_ted = bool(ted_data and ted_data.get("source") == "SII_TED_PDF417")
+    ocr_normalized = normalize_document_text(
+        raw_text,
+        image_path=storage_info["main_disk_path"],
+        use_llm_fallback=not has_full_ted,
+    )
     normalized_data = merge_sii_ted_with_ocr(ted_data, ocr_normalized)
 
-    if ted_data and ted_data.get("source") == "SII_TED_PDF417":
+    if has_full_ted:
         ted_header = (
             f"[TIMBRE SII PDF417 VERIFICADO] "
             f"RUT: {normalized_data['issuer']['tax_id']} | "
@@ -143,16 +148,19 @@ async def create_scan(
     )
     db.add(scan)
 
+    if has_full_ted:
+        mod_by = "SII_TED_PDF417"
+    elif normalized_data.get("llm_refined"):
+        mod_by = "OCR_LLM_HYBRID"
+    else:
+        mod_by = "OCR_AUTOMATIC"
+
     version_1 = ScanVersion(
         scan_id=scan_id,
         version_number=1,
         raw_text=raw_text,
         normalized_data=normalized_data,
-        modified_by=(
-            "SII_TED_PDF417"
-            if (ted_data and ted_data.get("source") == "SII_TED_PDF417")
-            else "OCR_AUTOMATIC"
-        ),
+        modified_by=mod_by,
     )
     db.add(version_1)
     db.commit()
