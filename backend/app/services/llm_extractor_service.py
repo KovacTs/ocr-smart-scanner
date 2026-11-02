@@ -158,15 +158,21 @@ def _call_gemini_api(
 ) -> Optional[dict[str, Any]]:
     """
     Invoca a Google Gemini Flash API (Multimodal: Imagen WebP + Texto OCR) con salida JSON estructurada.
+    Soporta cascada automática de modelos Flash en caso de alta demanda temporal (503 / timeout).
     """
     api_key = settings.GEMINI_API_KEY.strip()
     if not api_key:
         return None
 
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{settings.GEMINI_MODEL}:generateContent?key={api_key}"
-    )
+    candidate_models = [settings.GEMINI_MODEL]
+    for fallback in [
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-flash-lite-latest",
+    ]:
+        if fallback not in candidate_models:
+            candidate_models.append(fallback)
 
     parts: list[dict[str, Any]] = [
         {
@@ -205,23 +211,33 @@ def _call_gemini_api(
         },
     }
 
-    timeout = httpx.Timeout(settings.LLM_TIMEOUT_SECONDS, connect=2.0)
-    try:
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post(url, json=payload)
-            if resp.status_code != 200:
-                return None
-            body = resp.json()
-            candidates = body.get("candidates") or []
-            if not candidates:
-                return None
-            content_parts = candidates[0].get("content", {}).get("parts") or []
-            if not content_parts:
-                return None
-            text_out = content_parts[0].get("text", "")
-            return _extract_json_object(text_out)
-    except Exception:
-        return None
+    timeout = httpx.Timeout(settings.LLM_TIMEOUT_SECONDS, connect=3.0)
+    for model_name in candidate_models:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_name}:generateContent?key={api_key}"
+        )
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.post(url, json=payload)
+                if resp.status_code != 200:
+                    continue
+                body = resp.json()
+                candidates = body.get("candidates") or []
+                if not candidates:
+                    continue
+                content_parts = candidates[0].get("content", {}).get("parts") or []
+                if not content_parts:
+                    continue
+                text_out = content_parts[0].get("text", "")
+                parsed = _extract_json_object(text_out)
+                if parsed:
+                    parsed["_provider"] = f"GEMINI ({model_name})"
+                    return parsed
+        except Exception:
+            continue
+
+    return None
 
 
 def extract_structured_data_with_llm(

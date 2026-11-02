@@ -113,7 +113,7 @@ async def create_scan(
     has_full_ted = bool(ted_data and ted_data.get("source") == "SII_TED_PDF417")
     ocr_normalized = normalize_document_text(
         raw_text,
-        image_path=storage_info["main_disk_path"],
+        image_path=None if raw_text_hint else storage_info["main_disk_path"],
         use_llm_fallback=not has_full_ted,
     )
     normalized_data = merge_sii_ted_with_ocr(ted_data, ocr_normalized)
