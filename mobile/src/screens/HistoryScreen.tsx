@@ -12,8 +12,10 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import * as Haptics from 'expo-haptics';
 import { apiClient } from '../api/client';
 import { useAuth } from '../context/AuthContext';
+import { offlineQueue, OfflineScanItem } from '../services/offlineQueue';
 import { ScanItem } from '../types/models';
 
 interface Props {
@@ -27,20 +29,29 @@ export const HistoryScreen: React.FC<Props> = ({
 }) => {
   const { token, user, logout } = useAuth();
   const [scans, setScans] = useState<ScanItem[]>([]);
+  const [offlineItems, setOfflineItems] = useState<OfflineScanItem[]>([]);
+  const [syncingOffline, setSyncingOffline] = useState<boolean>(false);
   const [search, setSearch] = useState<string>('');
+  const [viewTrash, setViewTrash] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(false);
   const [exporting, setExporting] = useState<boolean>(false);
   const [deleting, setDeleting] = useState<boolean>(false);
+  const [restoring, setRestoring] = useState<boolean>(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
 
   const fetchScans = useCallback(async () => {
     if (!token) return;
     setLoading(true);
     try {
-      const list = await apiClient.listScans(token, {
-        search: search.trim() || undefined,
-      });
+      const [list, pending] = await Promise.all([
+        apiClient.listScans(token, {
+          search: search.trim() || undefined,
+          only_deleted: viewTrash,
+        }),
+        offlineQueue.getPendingScans(),
+      ]);
       setScans(list);
+      setOfflineItems(pending);
       setSelectedIds((prev) =>
         prev.filter((id) => list.some((s) => s.id === id))
       );
@@ -49,13 +60,44 @@ export const HistoryScreen: React.FC<Props> = ({
     } finally {
       setLoading(false);
     }
-  }, [token, search]);
+  }, [token, search, viewTrash]);
 
   useEffect(() => {
     fetchScans();
   }, [fetchScans]);
 
+  const handleSyncOffline = async () => {
+    if (!token || syncingOffline) return;
+    setSyncingOffline(true);
+    try {
+      const res = await offlineQueue.syncAll(token);
+      if (Platform.OS !== 'web') {
+        Haptics.notificationAsync(
+          Haptics.NotificationFeedbackType.Success
+        ).catch(() => {});
+      }
+      Alert.alert(
+        'Sincronización Completada',
+        `Se subieron exitosamente ${res.synced} comprobante(s) al servidor.` +
+          (res.failed > 0
+            ? ` (${res.failed} fallaron y permanecen en cola).`
+            : '')
+      );
+      await fetchScans();
+    } catch (err: any) {
+      Alert.alert(
+        'Error al sincronizar',
+        err.message || 'Verifica tu conexión a internet.'
+      );
+    } finally {
+      setSyncingOffline(false);
+    }
+  };
+
   const toggleSelection = (id: string) => {
+    if (Platform.OS !== 'web') {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+    }
     setSelectedIds((prev) =>
       prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
     );
@@ -88,24 +130,42 @@ export const HistoryScreen: React.FC<Props> = ({
     }
   };
 
+  const handleBatchRestore = async () => {
+    if (!token || selectedIds.length === 0) return;
+    setRestoring(true);
+    try {
+      await apiClient.restoreScansBatch(token, selectedIds);
+      setSelectedIds([]);
+      await fetchScans();
+    } catch (err: any) {
+      Alert.alert(
+        'Error al restaurar',
+        err.message || 'Intenta nuevamente'
+      );
+    } finally {
+      setRestoring(false);
+    }
+  };
+
   const handleBatchDelete = () => {
     if (!token || selectedIds.length === 0) return;
 
     const count = selectedIds.length;
+    const isPermanent = viewTrash;
     Alert.alert(
-      'Confirmar eliminación',
-      count === 1
-        ? '¿Estás seguro de que deseas eliminar este escaneo y su imagen original?'
-        : `¿Estás seguro de que deseas eliminar los ${count} escaneos seleccionados? Esta acción no se puede deshacer.`,
+      isPermanent ? 'Eliminación definitiva' : 'Mover a la Papelera Tributaria',
+      isPermanent
+        ? `¿Deseas eliminar definitivamente ${count} comprobante(s) y destruir sus imágenes WebP? Esta acción es irreversible.`
+        : `Se moverán ${count} comprobante(s) a la Papelera de Reciclaje conservando el respaldo tributario para recuperación.`,
       [
         { text: 'Cancelar', style: 'cancel' },
         {
-          text: 'Eliminar',
+          text: isPermanent ? 'Purgar definitivamente' : 'Mover a Papelera',
           style: 'destructive',
           onPress: async () => {
             setDeleting(true);
             try {
-              await apiClient.deleteScansBatch(token, selectedIds);
+              await apiClient.deleteScansBatch(token, selectedIds, isPermanent);
               setSelectedIds([]);
               await fetchScans();
             } catch (err: any) {
@@ -133,7 +193,7 @@ export const HistoryScreen: React.FC<Props> = ({
       <View style={styles.header}>
         <View style={styles.headerTextCol}>
           <Text style={styles.headerTitle} numberOfLines={1}>
-            Historial de Escaneos
+            {viewTrash ? 'Papelera Tributaria' : 'Historial de Escaneos'}
           </Text>
           <Text style={styles.headerSubtitle} numberOfLines={1}>
             {user?.full_name || user?.email || 'Documentos WebP + OCR'}
@@ -145,38 +205,100 @@ export const HistoryScreen: React.FC<Props> = ({
         </TouchableOpacity>
       </View>
 
-      {/* Fila de Botones Principales (50% / 50% Ancho Completo) */}
-      <View style={styles.actionRow}>
+      {/* Selector de Vista: Activos vs Papelera Tributaria (Soft-Delete) */}
+      <View style={styles.modeTabsRow}>
         <TouchableOpacity
-          style={styles.newScanButton}
-          onPress={onOpenCamera}
-          activeOpacity={0.85}
+          style={[styles.modeTab, !viewTrash && styles.modeTabActive]}
+          onPress={() => {
+            setSelectedIds([]);
+            setViewTrash(false);
+          }}
         >
-          <Text style={styles.newScanButtonText} numberOfLines={1}>
-            + Nuevo Escaneo
+          <Text
+            style={[
+              styles.modeTabText,
+              !viewTrash && styles.modeTabTextActive,
+            ]}
+          >
+            Documentos Activos
           </Text>
         </TouchableOpacity>
 
         <TouchableOpacity
-          style={[
-            styles.excelButton,
-            scans.length === 0 && styles.excelButtonDisabled,
-          ]}
-          onPress={handleBatchExportExcel}
-          disabled={exporting || scans.length === 0}
-          activeOpacity={0.85}
+          style={[styles.modeTab, viewTrash && styles.modeTabTrashActive]}
+          onPress={() => {
+            setSelectedIds([]);
+            setViewTrash(true);
+          }}
         >
-          {exporting ? (
-            <ActivityIndicator color="#FFFFFF" size="small" />
-          ) : (
-            <Text style={styles.excelButtonText} numberOfLines={1}>
-              {exportLabel}
-            </Text>
-          )}
+          <Text
+            style={[
+              styles.modeTabText,
+              viewTrash && styles.modeTabTextActive,
+            ]}
+          >
+            Papelera (Respaldo)
+          </Text>
         </TouchableOpacity>
       </View>
 
-      {/* Barra de Eliminación Múltiple / Selección (Visible cuando hay elementos en la lista) */}
+      {/* Banner de Sincronización Offline (Fase 2) */}
+      {offlineItems.length > 0 && !viewTrash && (
+        <View style={styles.offlineBanner}>
+          <View style={styles.offlineInfo}>
+            <Text style={styles.offlineTitle}>⚡ Modo Offline Activo</Text>
+            <Text style={styles.offlineSubtitle}>
+              {offlineItems.length} escaneo(s) guardado(s) en tu teléfono
+            </Text>
+          </View>
+          <TouchableOpacity
+            style={styles.offlineSyncBtn}
+            onPress={handleSyncOffline}
+            disabled={syncingOffline}
+          >
+            {syncingOffline ? (
+              <ActivityIndicator color="#FFFFFF" size="small" />
+            ) : (
+              <Text style={styles.offlineSyncBtnText}>Sincronizar</Text>
+            )}
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Fila de Botones Principales (50% / 50% Ancho Completo) */}
+      {!viewTrash && (
+        <View style={styles.actionRow}>
+          <TouchableOpacity
+            style={styles.newScanButton}
+            onPress={onOpenCamera}
+            activeOpacity={0.85}
+          >
+            <Text style={styles.newScanButtonText} numberOfLines={1}>
+              + Nuevo Escaneo
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[
+              styles.excelButton,
+              scans.length === 0 && styles.excelButtonDisabled,
+            ]}
+            onPress={handleBatchExportExcel}
+            disabled={exporting || scans.length === 0}
+            activeOpacity={0.85}
+          >
+            {exporting ? (
+              <ActivityIndicator color="#FFFFFF" size="small" />
+            ) : (
+              <Text style={styles.excelButtonText} numberOfLines={1}>
+                {exportLabel}
+              </Text>
+            )}
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Barra de Selección / Papelera / Eliminación Múltiple */}
       {scans.length > 0 && (
         <View style={styles.selectionToolbar}>
           <TouchableOpacity
@@ -190,6 +312,22 @@ export const HistoryScreen: React.FC<Props> = ({
             </Text>
           </TouchableOpacity>
 
+          {selectedIds.length > 0 && viewTrash && (
+            <TouchableOpacity
+              style={styles.restoreBatchBtn}
+              onPress={handleBatchRestore}
+              disabled={restoring}
+            >
+              {restoring ? (
+                <ActivityIndicator color="#FFFFFF" size="small" />
+              ) : (
+                <Text style={styles.restoreBatchText} numberOfLines={1}>
+                  Restaurar ({selectedIds.length})
+                </Text>
+              )}
+            </TouchableOpacity>
+          )}
+
           {selectedIds.length > 0 && (
             <TouchableOpacity
               style={styles.deleteBatchBtn}
@@ -200,7 +338,9 @@ export const HistoryScreen: React.FC<Props> = ({
                 <ActivityIndicator color="#FFFFFF" size="small" />
               ) : (
                 <Text style={styles.deleteBatchText} numberOfLines={1}>
-                  Eliminar ({selectedIds.length})
+                  {viewTrash
+                    ? `Purgar (${selectedIds.length})`
+                    : `Papelera (${selectedIds.length})`}
                 </Text>
               )}
             </TouchableOpacity>
@@ -236,10 +376,15 @@ export const HistoryScreen: React.FC<Props> = ({
           showsVerticalScrollIndicator={false}
           ListEmptyComponent={
             <View style={styles.emptyBox}>
-              <Text style={styles.emptyTitle}>Sin documentos registrados</Text>
+              <Text style={styles.emptyTitle}>
+                {viewTrash
+                  ? 'La papelera está vacía'
+                  : 'Sin documentos registrados'}
+              </Text>
               <Text style={styles.emptyText}>
-                Presiona el botón "+ Nuevo Escaneo" arriba para capturar tu
-                primera factura o boleta con validación de enfoque.
+                {viewTrash
+                  ? 'Los comprobantes eliminados aparecerán aquí para proteger tu respaldo tributario antes de su eliminación definitiva.'
+                  : 'Presiona el botón "+ Nuevo Escaneo" arriba para capturar tu primera factura o boleta con validación de enfoque.'}
               </Text>
             </View>
           }
@@ -250,9 +395,12 @@ export const HistoryScreen: React.FC<Props> = ({
               'Emisor Desconocido';
             const issuerRut =
               item.current_normalized_data?.issuer?.tax_id || 'S/RUT';
-            const thumbUri = token
-              ? apiClient.getProtectedImageUrl(item.thumbnail_url, token)
-              : '';
+            const thumbSource = token
+              ? apiClient.getProtectedImageSource(
+                  item.signed_thumbnail_url || item.thumbnail_url,
+                  token
+                )
+              : undefined;
             const sizeKb = Math.round((item.file_size_bytes || 0) / 1024);
 
             return (
@@ -262,18 +410,30 @@ export const HistoryScreen: React.FC<Props> = ({
                 onLongPress={() => toggleSelection(item.id)}
                 activeOpacity={0.85}
               >
-                <Image source={{ uri: thumbUri }} style={styles.thumbnail} />
+                {thumbSource && (
+                  <Image source={thumbSource} style={styles.thumbnail} />
+                )}
 
                 <View style={styles.cardBody}>
                   <View style={styles.cardTopRow}>
-                    <Text style={styles.docBadge} numberOfLines={1}>
-                      {item.document_type.replace('_', ' ')}
+                    <Text
+                      style={[
+                        styles.docBadge,
+                        item.status === 'PROCESSING' && styles.processingBadge,
+                      ]}
+                      numberOfLines={1}
+                    >
+                      {item.status === 'PROCESSING'
+                        ? '⏳ EN COLA ARQ'
+                        : item.document_type.replace('_', ' ')}
                     </Text>
                     <Text style={styles.webpBadge}>WebP {sizeKb} KB</Text>
                   </View>
 
                   <Text style={styles.issuerTitle} numberOfLines={1}>
-                    {issuerName}
+                    {item.status === 'PROCESSING'
+                      ? 'Procesando extracción OCR...'
+                      : issuerName}
                   </Text>
                   <Text style={styles.metaText} numberOfLines={1}>
                     Folio: {item.folio || 'S/N'} • RUT: {issuerRut}
@@ -323,7 +483,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 14,
+    marginBottom: 12,
   },
   headerTextCol: {
     flex: 1,
@@ -351,6 +511,36 @@ const styles = StyleSheet.create({
     color: '#F87171',
     fontWeight: '700',
     fontSize: 13,
+  },
+  modeTabsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 10,
+  },
+  modeTab: {
+    flex: 1,
+    backgroundColor: '#1E293B',
+    borderWidth: 1,
+    borderColor: '#334155',
+    paddingVertical: 9,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  modeTabActive: {
+    backgroundColor: '#0369A1',
+    borderColor: '#38BDF8',
+  },
+  modeTabTrashActive: {
+    backgroundColor: '#7C2D12',
+    borderColor: '#FB923C',
+  },
+  modeTabText: {
+    color: '#94A3B8',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  modeTabTextActive: {
+    color: '#FFFFFF',
   },
   actionRow: {
     flexDirection: 'row',
@@ -392,34 +582,48 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    gap: 10,
+    gap: 8,
     marginBottom: 10,
   },
   selectAllBtn: {
     backgroundColor: '#1E293B',
     borderWidth: 1,
     borderColor: '#334155',
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     paddingVertical: 10,
     borderRadius: 10,
   },
   selectAllText: {
     color: '#38BDF8',
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '700',
+  },
+  restoreBatchBtn: {
+    flex: 1,
+    backgroundColor: '#0284C7',
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  restoreBatchText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
   },
   deleteBatchBtn: {
     flex: 1,
     backgroundColor: '#DC2626',
     paddingVertical: 10,
-    paddingHorizontal: 14,
+    paddingHorizontal: 10,
     borderRadius: 10,
     alignItems: 'center',
     justifyContent: 'center',
   },
   deleteBatchText: {
     color: '#FFFFFF',
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '800',
   },
   searchWrapper: {
@@ -543,5 +747,46 @@ const styles = StyleSheet.create({
     color: '#FFF',
     fontSize: 13,
     fontWeight: '800',
+  },
+  offlineBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: 'rgba(2, 132, 199, 0.15)',
+    borderWidth: 1,
+    borderColor: '#0284C7',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 12,
+  },
+  offlineInfo: {
+    flex: 1,
+    marginRight: 10,
+  },
+  offlineTitle: {
+    color: '#38BDF8',
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 2,
+  },
+  offlineSubtitle: {
+    color: '#94A3B8',
+    fontSize: 11,
+  },
+  offlineSyncBtn: {
+    backgroundColor: '#0284C7',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  offlineSyncBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  processingBadge: {
+    backgroundColor: '#3B82F6',
   },
 });

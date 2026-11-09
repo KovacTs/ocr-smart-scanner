@@ -1,6 +1,37 @@
-version: '3.8'
-
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ocr-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ocr_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ocr_secure_password_2026}
+      POSTGRES_DB: ${POSTGRES_DB:-ocr_scanner}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ocr_user} -d ${POSTGRES_DB:-ocr_scanner}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: ocr-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   backend:
     build:
       context: ./backend
@@ -9,7 +40,9 @@ services:
     restart: unless-stopped
     environment:
       - PROJECT_NAME=Smart OCR Scanner API
-      - DATABASE_URL=sqlite:////app/data/ocr_scanner.db
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-ocr_user}:${POSTGRES_PASSWORD:-ocr_secure_password_2026}@postgres:5432/${POSTGRES_DB:-ocr_scanner}
+      - REDIS_URL=redis://redis:6379/0
+      - USE_ASYNC_QUEUE=${USE_ASYNC_QUEUE:-true}
       - SECRET_KEY=${SECRET_KEY:-super-secret-ocr-jwt-key-oracle-cloud-2026}
       - BLUR_THRESHOLD_DEFAULT=380.0
       - WEBP_MAX_DIMENSION=2400
@@ -17,11 +50,16 @@ services:
       - LLM_PROVIDER=${LLM_PROVIDER:-AUTO}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://localhost:11434}
+      # Almacenamiento Cloud compatible S3 (AWS S3 y Oracle Cloud OCI Object Storage)
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-LOCAL}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-}
+      - S3_REGION_NAME=${S3_REGION_NAME:-us-east-1}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-}
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-}
     volumes:
       # Persistencia de imágenes WebP en el disco del VPS
       - ./uploads_data:/app/uploads
-      # Persistencia de la base de datos SQLite
-      - ./db_data:/app/data
     ports:
       # Exposición interna/directa si se requiere depuración
       - "8000:8000"
@@ -31,6 +69,43 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ocr-worker
+    restart: unless-stopped
+    command: python -m app.worker
+    environment:
+      - PROJECT_NAME=Smart OCR Scanner Worker
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-ocr_user}:${POSTGRES_PASSWORD:-ocr_secure_password_2026}@postgres:5432/${POSTGRES_DB:-ocr_scanner}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-super-secret-ocr-jwt-key-oracle-cloud-2026}
+      - BLUR_THRESHOLD_DEFAULT=380.0
+      - WEBP_MAX_DIMENSION=2400
+      - WEBP_QUALITY=82
+      - LLM_PROVIDER=${LLM_PROVIDER:-AUTO}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://localhost:11434}
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-LOCAL}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-}
+      - S3_REGION_NAME=${S3_REGION_NAME:-us-east-1}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-}
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-}
+    volumes:
+      - ./uploads_data:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   caddy:
     image: caddy:2-alpine
@@ -52,3 +127,5 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  postgres_data:
+  redis_data:

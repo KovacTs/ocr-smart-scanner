@@ -133,20 +133,41 @@ export const ScanDetailScreen: React.FC<Props> = ({
     }
   };
 
+  const isDeleted = Boolean(scan.deleted_at);
+
+  const handleRestoreScan = async () => {
+    if (!token) return;
+    setSaving(true);
+    try {
+      const restored = await apiClient.restoreScan(token, scan.id);
+      onScanUpdated(restored);
+      Alert.alert(
+        'Comprobante restaurado',
+        'El documento volvió a tu historial activo.'
+      );
+    } catch (err: any) {
+      Alert.alert('Error al restaurar', err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const handleDeleteScan = () => {
     if (!token) return;
     Alert.alert(
-      'Eliminar comprobante',
-      '¿Estás seguro de que deseas eliminar este escaneo y su imagen original del historial?',
+      isDeleted ? 'Purgar definitivamente' : 'Mover a la Papelera Tributaria',
+      isDeleted
+        ? '¿Deseas eliminar definitivamente este comprobante y su imagen WebP? Esta acción no se puede deshacer.'
+        : 'El comprobante se moverá a la Papelera de Reciclaje conservando su imagen y versiones para respaldo tributario.',
       [
         { text: 'Cancelar', style: 'cancel' },
         {
-          text: 'Eliminar',
+          text: isDeleted ? 'Purgar definitivamente' : 'Mover a Papelera',
           style: 'destructive',
           onPress: async () => {
             setDeleting(true);
             try {
-              await apiClient.deleteScan(token, scan.id);
+              await apiClient.deleteScan(token, scan.id, isDeleted);
               onBack();
             } catch (err: any) {
               Alert.alert('Error al eliminar', err.message);
@@ -159,9 +180,12 @@ export const ScanDetailScreen: React.FC<Props> = ({
     );
   };
 
-  const fullWebpUrl = token
-    ? apiClient.getProtectedImageUrl(scan.image_url, token)
-    : '';
+  const fullWebpSource = token
+    ? apiClient.getProtectedImageSource(
+        scan.signed_image_url || scan.image_url,
+        token
+      )
+    : undefined;
   const origKb = Math.round((scan.original_size_bytes || 0) / 1024);
   const webpKb = Math.round((scan.file_size_bytes || 0) / 1024);
   const savedPct =
@@ -175,15 +199,17 @@ export const ScanDetailScreen: React.FC<Props> = ({
           <Text style={styles.backText}>← Historial</Text>
         </TouchableOpacity>
         <Text style={styles.headerTitle} numberOfLines={1}>
-          Detalle del Comprobante
+          {isDeleted ? 'En Papelera Tributaria' : 'Detalle del Comprobante'}
         </Text>
-        <TouchableOpacity
-          onPress={handleExportSingleExcel}
-          style={styles.excelHeaderBtn}
-          disabled={exporting}
-        >
-          <Text style={styles.excelHeaderText}>Excel</Text>
-        </TouchableOpacity>
+        {!isDeleted && (
+          <TouchableOpacity
+            onPress={handleExportSingleExcel}
+            style={styles.excelHeaderBtn}
+            disabled={exporting}
+          >
+            <Text style={styles.excelHeaderText}>Excel</Text>
+          </TouchableOpacity>
+        )}
       </View>
 
       <ScrollView
@@ -203,11 +229,13 @@ export const ScanDetailScreen: React.FC<Props> = ({
             </TouchableOpacity>
           </View>
 
-          <Image
-            source={{ uri: fullWebpUrl }}
-            style={[styles.docImage, zoomed && styles.docImageZoomed]}
-            resizeMode="contain"
-          />
+          {fullWebpSource && (
+            <Image
+              source={fullWebpSource}
+              style={[styles.docImage, zoomed && styles.docImageZoomed]}
+              resizeMode="contain"
+            />
+          )}
 
           <Text style={styles.compressionMeta}>
             Optimización WebP: {origKb} KB → {webpKb} KB (-{savedPct}%) • Score
@@ -331,33 +359,51 @@ export const ScanDetailScreen: React.FC<Props> = ({
             </View>
           </View>
 
-          <TouchableOpacity
-            style={styles.saveVersionBtn}
-            onPress={handleSaveNewVersion}
-            disabled={saving}
-          >
-            {saving ? (
-              <ActivityIndicator color="#FFF" />
-            ) : (
-              <Text style={styles.saveVersionText}>
-                Guardar Corrección como Nueva Versión
-              </Text>
-            )}
-          </TouchableOpacity>
+          {isDeleted ? (
+            <TouchableOpacity
+              style={styles.saveVersionBtn}
+              onPress={handleRestoreScan}
+              disabled={saving}
+            >
+              {saving ? (
+                <ActivityIndicator color="#FFF" />
+              ) : (
+                <Text style={styles.saveVersionText}>
+                  Restaurar desde la Papelera al Historial Activo
+                </Text>
+              )}
+            </TouchableOpacity>
+          ) : (
+            <>
+              <TouchableOpacity
+                style={styles.saveVersionBtn}
+                onPress={handleSaveNewVersion}
+                disabled={saving}
+              >
+                {saving ? (
+                  <ActivityIndicator color="#FFF" />
+                ) : (
+                  <Text style={styles.saveVersionText}>
+                    Guardar Corrección como Nueva Versión
+                  </Text>
+                )}
+              </TouchableOpacity>
 
-          <TouchableOpacity
-            style={styles.fullExcelBtn}
-            onPress={handleExportSingleExcel}
-            disabled={exporting}
-          >
-            {exporting ? (
-              <ActivityIndicator color="#FFF" />
-            ) : (
-              <Text style={styles.fullExcelText}>
-                Exportar este Comprobante a Excel (.xlsx)
-              </Text>
-            )}
-          </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.fullExcelBtn}
+                onPress={handleExportSingleExcel}
+                disabled={exporting}
+              >
+                {exporting ? (
+                  <ActivityIndicator color="#FFF" />
+                ) : (
+                  <Text style={styles.fullExcelText}>
+                    Exportar este Comprobante a Excel (.xlsx)
+                  </Text>
+                )}
+              </TouchableOpacity>
+            </>
+          )}
 
           <TouchableOpacity
             style={styles.deleteBtn}
@@ -368,7 +414,9 @@ export const ScanDetailScreen: React.FC<Props> = ({
               <ActivityIndicator color="#FFF" />
             ) : (
               <Text style={styles.deleteBtnText}>
-                Eliminar este Comprobante
+                {isDeleted
+                  ? 'Purgar Definitivamente del Sistema'
+                  : 'Mover a la Papelera Tributaria'}
               </Text>
             )}
           </TouchableOpacity>

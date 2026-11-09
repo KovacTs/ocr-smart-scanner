@@ -1,6 +1,7 @@
 import io
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw
 from openpyxl import load_workbook
 from fastapi.testclient import TestClient
 from app.main import app
@@ -361,5 +362,233 @@ def test_llm_semantic_refinement_and_sanitization(monkeypatch):
     assert norm["issuer"]["legal_name"] == "HIPER LIMITADA (LIDER)"
     assert norm["llm_refined"] is True
     assert scan_json["versions"][0]["modified_by"] == "OCR_LLM_HYBRID"
+
+
+def test_evaluate_focus_and_precomputed_blur_score_freeze_release_flow():
+    """
+    Valida el flujo de mejora UX 'Evaluate -> Freeze & Release -> Analyze':
+    1. El cliente móvil evalúa primero el enfoque óptimo con POST /api/scans/evaluate-focus.
+    2. Una vez confirmado is_focused=True, congela la imagen, apaga la cámara y envía POST /api/scans
+       con force_capture=True y precomputed_blur_score para evitar doble cálculo de enfoque.
+    """
+    login_res = client.post(
+        "/api/auth/login",
+        json={"email": "auditor@empresa.cl", "password": "PasswordSeguro123!"},
+    )
+    assert login_res.status_code == 200
+    token = login_res.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    sharp_bytes = generate_synthetic_document_image(blurry=False, high_res=False)
+    eval_res = client.post(
+        "/api/scans/evaluate-focus",
+        headers=headers,
+        files={"file": ("frame_960.jpg", sharp_bytes, "image/jpeg")},
+    )
+    assert eval_res.status_code == 200
+    eval_data = eval_res.json()
+    assert eval_data["is_focused"] is True
+    validated_score = eval_data["blur_score"]
+
+    scan_res = client.post(
+        "/api/scans",
+        headers=headers,
+        files={"file": ("frozen_capture.jpg", sharp_bytes, "image/jpeg")},
+        data={
+            "force_capture": "true",
+            "precomputed_blur_score": str(validated_score),
+            "raw_text_hint": "BOLETA ELECTRONICA N° 998877\nRUT: 76.543.210-K\nTOTAL: $ 11.900",
+        },
+    )
+    assert scan_res.status_code == 201
+    scan_json = scan_res.json()
+    assert scan_json["blur_score"] == validated_score
+    assert scan_json["folio"] == "998877"
+    assert scan_json["total_amount"] == 11900.0
+
+
+def test_phase1_security_soft_delete_and_decimal_precision():
+    """
+    Valida todos los hitos de la Fase 1 del Roadmap:
+    1. Emisión y rotación de Refresh Token + bloqueo de uso de Refresh Token como Access Token.
+    2. Rechazo de token JWT en query string (?token=...) y acceso seguro mediante URL pre-firmada HMAC
+       (signed_image_url / signed_thumbnail_url) sin exponer el JWT.
+    3. Validación de Magic Bytes (rechazo de archivos que no sean imágenes reales).
+    4. Precisión financiera Numeric(14, 2) (Decimal) en el modelo Scan.
+    5. Papelera Tributaria (Soft-Delete con deleted_at), restauración y purga definitiva.
+    """
+    from decimal import Decimal
+    from app.db.database import SessionLocal
+    from app.models.scan import Scan
+
+    login_res = client.post(
+        "/api/auth/login",
+        json={"email": "auditor@empresa.cl", "password": "PasswordSeguro123!"},
+    )
+    assert login_res.status_code == 200
+    login_data = login_res.json()
+    access_token = login_data["access_token"]
+    refresh_token = login_data["refresh_token"]
+    assert refresh_token is not None
+
+    # 1. El refresh_token no puede usarse directamente como Bearer token de acceso
+    bad_use_res = client.get(
+        "/api/auth/me",
+        headers={"Authorization": f"Bearer {refresh_token}"},
+    )
+    assert bad_use_res.status_code == 401
+
+    # Rotación de tokens mediante /api/auth/refresh
+    refresh_res = client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": refresh_token},
+    )
+    assert refresh_res.status_code == 200
+    refreshed_data = refresh_res.json()
+    token = refreshed_data["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 2. Validación de Magic Bytes: rechazar un archivo ejecutable o texto disfrazado de JPEG
+    fake_file_res = client.post(
+        "/api/scans",
+        headers=headers,
+        files={"file": ("malicious.jpg", b"MZ-fake-binary-payload-not-an-image", "image/jpeg")},
+    )
+    assert fake_file_res.status_code == 400
+
+    # Crear un escaneo válido para probar URLs pre-firmadas, Decimal y Soft-Delete
+    sharp_bytes = generate_synthetic_document_image(blurry=False, high_res=False)
+    scan_res = client.post(
+        "/api/scans",
+        headers=headers,
+        files={"file": ("fase1_doc.jpg", sharp_bytes, "image/jpeg")},
+        data={
+            "force_capture": "true",
+            "precomputed_blur_score": "520.0",
+            "raw_text_hint": "FACTURA ELECTRONICA N° 774411\nRUT: 76.543.210-K\nTOTAL: $ 154.990",
+        },
+    )
+    assert scan_res.status_code == 201
+    scan_json = scan_res.json()
+    scan_id = scan_json["id"]
+
+    # 3. Verificar que el token JWT en query string (?token=...) es RECHAZADO (OWASP)
+    legacy_query_token_res = client.get(
+        f"{scan_json['image_url']}?token={token}"
+    )
+    assert legacy_query_token_res.status_code == 401
+
+    # Verificar que la URL pre-firmada HMAC (sin cabecera Authorization y sin JWT) funciona
+    assert "sig=" in scan_json["signed_image_url"]
+    assert "expires=" in scan_json["signed_image_url"]
+    assert token not in scan_json["signed_image_url"]
+
+    signed_img_res = client.get(scan_json["signed_image_url"])
+    assert signed_img_res.status_code == 200
+    assert signed_img_res.headers["content-type"] == "image/webp"
+
+    # Verificar que una firma HMAC alterada es rechazada
+    tampered_url = scan_json["signed_image_url"] + "00"
+    tampered_res = client.get(tampered_url)
+    assert tampered_res.status_code == 401
+
+    # 4. Verificar precisión Decimal Numeric(14, 2) en la base de datos
+    with SessionLocal() as db:
+        db_scan = db.query(Scan).filter(Scan.id == scan_id).first()
+        assert db_scan is not None
+        assert isinstance(db_scan.total_amount, Decimal)
+        assert db_scan.total_amount == Decimal("154990.00")
+        assert db_scan.deleted_at is None
+
+    # 5. Soft-Delete (Papelera Tributaria) y Restauración
+    del_res = client.delete(f"/api/scans/{scan_id}", headers=headers)
+    assert del_res.status_code == 204
+
+    # No debe aparecer en el listado de activos ni en el detalle normal
+    detail_active_res = client.get(f"/api/scans/{scan_id}", headers=headers)
+    assert detail_active_res.status_code == 404
+
+    # Debe aparecer en la Papelera (/api/scans/trash) y sus imágenes siguen resguardadas
+    trash_res = client.get("/api/scans/trash", headers=headers)
+    assert trash_res.status_code == 200
+    trash_ids = [s["id"] for s in trash_res.json()]
+    assert scan_id in trash_ids
+
+    # Restaurar desde la Papelera al historial activo
+    restore_res = client.post(f"/api/scans/{scan_id}/restore", headers=headers)
+    assert restore_res.status_code == 200
+    restored_json = restore_res.json()
+    assert restored_json["deleted_at"] is None
+
+    # Ahora vuelve a estar disponible en el detalle activo
+    detail_restored_res = client.get(f"/api/scans/{scan_id}", headers=headers)
+    assert detail_restored_res.status_code == 200
+
+    # Purga definitiva (permanent=True) elimina registro e imágenes
+    purge_res = client.delete(
+        f"/api/scans/{scan_id}?permanent=true", headers=headers
+    )
+    assert purge_res.status_code == 204
+
+    trash_after_purge = client.get("/api/scans/trash", headers=headers)
+    assert scan_id not in [s["id"] for s in trash_after_purge.json()]
+
+
+def test_phase2_google_auth_and_async_scan_queue():
+    """
+    Prueba integral de las capacidades de la Fase 2:
+    1. Login y registro automático con Google OAuth2 (ID Token).
+    2. Subida de escaneo en modo asíncrono (async_mode=True) respondiendo con status=PROCESSING.
+    3. Consulta al nuevo endpoint de status rápido GET /api/scans/{id}/status.
+    """
+    # 1. Google OAuth2 Login
+    mock_token = "mock_google_:fernando.cloud@empresa.cl:Fernando Cloud:google_sub_12345678"
+    google_res = client.post("/api/auth/google", json={"id_token": mock_token})
+    assert google_res.status_code == 200
+    auth_data = google_res.json()
+    assert "access_token" in auth_data
+    assert "refresh_token" in auth_data
+    assert auth_data["user"]["email"] == "fernando.cloud@empresa.cl"
+    assert auth_data["user"]["full_name"] == "Fernando Cloud"
+    assert auth_data["user"]["google_id"] == "google_sub_12345678"
+
+    token = auth_data["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Re-login con el mismo ID token debe devolver el mismo usuario vinculado
+    relogin_res = client.post("/api/auth/google", json={"id_token": mock_token})
+    assert relogin_res.status_code == 200
+    assert relogin_res.json()["user"]["id"] == auth_data["user"]["id"]
+
+    # 2. Subida en Modo Asíncrono (async_mode=True)
+    img = Image.new("RGB", (1200, 1600), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.text((100, 100), "RUT: 76.123.456-7\nBOL. ELECTRONICA: 4500\nTOTAL: $15.000", fill=(0, 0, 0))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    buf.seek(0)
+
+    upload_res = client.post(
+        "/api/scans",
+        headers=headers,
+        files={"file": ("boleta_async.jpg", buf, "image/jpeg")},
+        data={
+            "force_capture": "true",
+            "async_mode": "true",
+            "precomputed_blur_score": "450.0",
+        },
+    )
+    assert upload_res.status_code == 201
+    scan_json = upload_res.json()
+    scan_id = scan_json["id"]
+    assert scan_json["status"] in ("PROCESSING", "COMPLETED")
+
+    # 3. Consulta de Status Liviano
+    status_res = client.get(f"/api/scans/{scan_id}/status", headers=headers)
+    assert status_res.status_code == 200
+    status_json = status_res.json()
+    assert status_json["id"] == scan_id
+    assert status_json["status"] in ("PROCESSING", "COMPLETED")
+
 
 

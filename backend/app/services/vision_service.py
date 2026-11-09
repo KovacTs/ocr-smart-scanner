@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 from app.core.config import settings
+from app.services.storage_service import storage_service
 
 
 def detect_document_roi(gray_img: np.ndarray) -> Tuple[np.ndarray, bool, list[int]]:
@@ -205,6 +206,19 @@ def optimize_and_save_webp(
 
     optimized_size = main_path.stat().st_size
     thumb_size = thumb_path.stat().st_size
+
+    # Si el backend de almacenamiento es S3 / Oracle OCI, subir inmediatamente los WebP generados
+    if settings.STORAGE_BACKEND.upper() == "S3":
+        storage_service.save_bytes(
+            main_path.read_bytes(),
+            f"{user_id}/{scan_id}/document.webp",
+            content_type="image/webp",
+        )
+        storage_service.save_bytes(
+            thumb_path.read_bytes(),
+            f"{user_id}/{scan_id}/thumbnail.webp",
+            content_type="image/webp",
+        )
 
     return {
         "image_url": f"/api/scans/files/{user_id}/{scan_id}/document.webp",

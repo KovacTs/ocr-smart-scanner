@@ -11,7 +11,9 @@
         {
           "cameraPermission": "Permitir acceso a la cámara para escanear documentos con enfoque asistido."
         }
-      ]
+      ],
+      "expo-secure-store",
+      "expo-web-browser"
     ]
   }
 }

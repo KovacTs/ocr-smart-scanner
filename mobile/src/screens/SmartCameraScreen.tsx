@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Image,
   Platform,
   StatusBar,
   StyleSheet,
@@ -12,8 +13,10 @@ import {
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Gyroscope } from 'expo-sensors';
+import * as Haptics from 'expo-haptics';
 import { apiClient } from '../api/client';
 import { useAuth } from '../context/AuthContext';
+import { offlineQueue } from '../services/offlineQueue';
 import { ScanItem } from '../types/models';
 
 interface Props {
@@ -21,7 +24,7 @@ interface Props {
   onNavigateHistory: () => void;
 }
 
-const STABILITY_TICKS_REQUIRED = 5; // ~1.7s para asegurar bloqueo físico del lente AF
+const STABILITY_TICKS_REQUIRED = 3; // ~1.0s de estabilidad para validar enfoque óptimo rápido
 const GYRO_STRONG_JERK_LIMIT = 1.1; // Detecta movimiento sin bloquear por pulso humano
 
 export const SmartCameraScreen: React.FC<Props> = ({
@@ -47,9 +50,19 @@ export const SmartCameraScreen: React.FC<Props> = ({
   const [blurScore, setBlurScore] = useState<number>(0);
   const [threshold, setThreshold] = useState<number>(380);
   const [stableTicks, setStableTicks] = useState<number>(0);
+  const [isEvaluatingFocus, setIsEvaluatingFocus] = useState<boolean>(false);
   const [isProcessingUpload, setIsProcessingUpload] = useState<boolean>(false);
   const [showForceButton, setShowForceButton] = useState<boolean>(false);
   const [detectedTedLabel, setDetectedTedLabel] = useState<string | null>(null);
+
+  // Estado de congelamiento instantáneo ("Freeze & Release")
+  const [capturedPreviewUri, setCapturedPreviewUri] = useState<string | null>(
+    null
+  );
+  const [capturedBlurScore, setCapturedBlurScore] = useState<
+    number | undefined
+  >(undefined);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
   const stableTicksRef = useRef<number>(0);
   const isCapturingRef = useRef<boolean>(false);
@@ -58,10 +71,15 @@ export const SmartCameraScreen: React.FC<Props> = ({
   const lastGyroMagnitudeRef = useRef<number>(0);
   const autoCaptureRef = useRef<boolean>(autoCapture);
   const detectedTedXmlRef = useRef<string>('');
+  const capturedPreviewUriRef = useRef<string | null>(null);
 
   useEffect(() => {
     autoCaptureRef.current = autoCapture;
   }, [autoCapture]);
+
+  useEffect(() => {
+    capturedPreviewUriRef.current = capturedPreviewUri;
+  }, [capturedPreviewUri]);
 
   /**
    * Detecta en vivo el Timbre Electrónico SII (PDF417 <TED>) o código de barras SII de 30-31 dígitos
@@ -96,6 +114,7 @@ export const SmartCameraScreen: React.FC<Props> = ({
    * alternando autofocus off -> on.
    */
   const triggerHardwareRefocus = useCallback(() => {
+    if (capturedPreviewUriRef.current) return;
     setAutofocusMode('off');
     stableTicksRef.current = 0;
     setStableTicks(0);
@@ -106,25 +125,136 @@ export const SmartCameraScreen: React.FC<Props> = ({
     }, 120);
   }, []);
 
+  /**
+   * Descarta la imagen congelada y reactiva la cámara en vivo
+   */
+  const discardCapturedPreview = useCallback(() => {
+    isCapturingRef.current = false;
+    setIsProcessingUpload(false);
+    setIsEvaluatingFocus(false);
+    setUploadError(null);
+    setCapturedPreviewUri(null);
+    setCapturedBlurScore(undefined);
+    stableTicksRef.current = 0;
+    setStableTicks(0);
+    setStatusColor('GREEN');
+    setHudMessage('Toque el recuadro para reenfocar • Mantenga a ~18cm');
+    cooldownUntilRef.current = Date.now() + 800;
+  }, []);
+
+  /**
+   * Fase C: Ejecuta el análisis OCR + Timbre SII + LLM sobre la foto YA congelada,
+   * con la cámara apagada para que el usuario pueda bajar el teléfono cómodamente.
+   */
+  const analyzeCapturedPhoto = useCallback(
+    async (photoUri: string, validatedScore?: number) => {
+      if (!token) return;
+
+      isCapturingRef.current = true;
+      setIsProcessingUpload(true);
+      setUploadError(null);
+      setStatusColor('GREEN');
+      setHudMessage(
+        '✓ ¡Boleta capturada! Ya puedes bajar el teléfono mientras analizamos'
+      );
+
+      try {
+        const savedScan = await apiClient.uploadScanWebP(
+          token,
+          photoUri,
+          true,
+          detectedTedXmlRef.current || undefined,
+          validatedScore
+        );
+        setShowForceButton(false);
+        if (Platform.OS !== 'web') {
+          Haptics.notificationAsync(
+            Haptics.NotificationFeedbackType.Success
+          ).catch(() => {});
+        }
+        onScanCompleted(savedScan);
+      } catch (err: any) {
+        if (Platform.OS !== 'web') {
+          Haptics.notificationAsync(
+            Haptics.NotificationFeedbackType.Error
+          ).catch(() => {});
+        }
+        const msg =
+          err.message || 'Error de conexión con el servidor OCR';
+        setStatusColor('RED');
+        setUploadError(msg);
+        setHudMessage(
+          'Error al enviar la captura — Puedes reintentar o guardar sin conexión'
+        );
+      } finally {
+        isCapturingRef.current = false;
+        setIsProcessingUpload(false);
+      }
+    },
+    [token, onScanCompleted]
+  );
+
+  /**
+   * Guarda la imagen congelada en la cola offline local (Fase 2)
+   */
+  const handleSaveToOfflineQueue = useCallback(async () => {
+    if (!capturedPreviewUri) return;
+    try {
+      await offlineQueue.enqueue({
+        photoUri: capturedPreviewUri,
+        siiTedXml: detectedTedXmlRef.current || undefined,
+        precomputedBlurScore: capturedBlurScore,
+      });
+      if (Platform.OS !== 'web') {
+        Haptics.notificationAsync(
+          Haptics.NotificationFeedbackType.Success
+        ).catch(() => {});
+      }
+      Alert.alert(
+        'Guardado en Cola Offline',
+        'El comprobante se guardó localmente en tu dispositivo. Podrás sincronizarlo con un toque desde el Historial cuando recuperes señal.',
+        [
+          {
+            text: 'Ir al Historial',
+            onPress: () => {
+              discardCapturedPreview();
+              onNavigateHistory();
+            },
+          },
+        ]
+      );
+    } catch (e: any) {
+      Alert.alert('Error', e.message || 'No se pudo guardar localmente.');
+    }
+  }, [
+    capturedPreviewUri,
+    capturedBlurScore,
+    discardCapturedPreview,
+    onNavigateHistory,
+  ]);
+
+  /**
+   * Flujo en 3 fases:
+   * 1. Toma frame cuando el pulso está estable.
+   * 2. Evalúa nitidez del texto en /evaluate-focus (~100ms). Si está borroso, reenfoca sin congelar.
+   * 3. Apenas el enfoque es óptimo, CONGELA la foto en pantalla, APAGA la cámara/flash y lanza el OCR.
+   */
   const executeSmartCapture = useCallback(
     async (forceCapture = false) => {
       if (
         !cameraRef.current ||
         !token ||
         isCapturingRef.current ||
-        !isCameraReadyRef.current
+        !isCameraReadyRef.current ||
+        capturedPreviewUriRef.current
       ) {
         return;
       }
 
       isCapturingRef.current = true;
-      setIsProcessingUpload(true);
+      setIsEvaluatingFocus(true);
       setStatusColor('GREEN');
-      setHudMessage(
-        detectedTedXmlRef.current
-          ? 'Procesando Timbre SII Criptográfico + Imagen WebP...'
-          : 'Mejorando contraste CLAHE y ejecutando OCR neuronal...'
-      );
+      setHudMessage('Verificando enfoque óptimo del texto...');
 
       try {
         const photo = await cameraRef.current.takePictureAsync({
@@ -136,47 +266,77 @@ export const SmartCameraScreen: React.FC<Props> = ({
           throw new Error('No se pudo obtener la imagen de la cámara.');
         }
 
-        const savedScan = await apiClient.uploadScanWebP(
-          token,
-          photo.uri,
-          forceCapture,
-          detectedTedXmlRef.current || undefined
-        );
-        setShowForceButton(false);
-        onScanCompleted(savedScan);
-      } catch (err: any) {
-        if (err.focusAnalysis) {
-          const score = err.focusAnalysis.blur_score ?? 0;
-          const thresh = err.focusAnalysis.threshold ?? 380;
-          setBlurScore(score);
-          setThreshold(thresh);
-          setStatusColor('YELLOW');
-          setShowForceButton(true);
-          setHudMessage(
-            `Foco insuficiente (${score.toFixed(0)}/${thresh.toFixed(
-              0
-            )}) — Aléjese a ~18cm o use 1.3x`
+        let validatedScore: number | undefined = undefined;
+
+        // Fase A: Evaluación rápida de enfoque antes de congelar y antes del OCR pesado
+        if (!forceCapture && !detectedTedXmlRef.current) {
+          const focusCheck = await apiClient.evaluateFrameFocus(
+            token,
+            photo.uri
           );
-          triggerHardwareRefocus();
-          cooldownUntilRef.current = Date.now() + 1800;
-        } else {
-          setStatusColor('RED');
-          setHudMessage(
-            err.message || 'Error de conexión con el servidor OCR'
-          );
-          cooldownUntilRef.current = Date.now() + 2200;
-          stableTicksRef.current = 0;
-          setStableTicks(0);
-          if (!autoCaptureRef.current) {
-            Alert.alert('Aviso', err.message || 'No se pudo procesar la foto');
+          setBlurScore(focusCheck.blur_score);
+          setThreshold(focusCheck.threshold);
+          validatedScore = focusCheck.blur_score;
+
+          if (!focusCheck.document_detected) {
+            setStatusColor('RED');
+            setHudMessage(
+              focusCheck.message || 'Apunte al texto de la boleta o factura'
+            );
+            cooldownUntilRef.current = Date.now() + 900;
+            stableTicksRef.current = 0;
+            setStableTicks(0);
+            isCapturingRef.current = false;
+            setIsEvaluatingFocus(false);
+            return;
+          }
+
+          if (!focusCheck.is_focused) {
+            setStatusColor('YELLOW');
+            setShowForceButton(true);
+            setHudMessage(
+              `Foco insuficiente (${focusCheck.blur_score.toFixed(
+                0
+              )}/${focusCheck.threshold.toFixed(
+                0
+              )}) — Aléjese a ~18cm o use 1.3x`
+            );
+            triggerHardwareRefocus();
+            cooldownUntilRef.current = Date.now() + 1300;
+            isCapturingRef.current = false;
+            setIsEvaluatingFocus(false);
+            return;
           }
         }
-      } finally {
+
+        // Fase B: ¡Enfoque óptimo confirmado! Congelar imagen en pantalla y apagar cámara + linterna
+        if (Platform.OS !== 'web') {
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
+        }
+        setIsEvaluatingFocus(false);
+        isCameraReadyRef.current = false;
+        setTorchOn(false);
+        setCapturedBlurScore(validatedScore);
+        setCapturedPreviewUri(photo.uri);
+
+        // Fase C: Ejecutar análisis OCR pesado mientras el usuario ya descansa la mano
+        await analyzeCapturedPhoto(photo.uri, validatedScore);
+      } catch (err: any) {
+        setIsEvaluatingFocus(false);
         isCapturingRef.current = false;
-        setIsProcessingUpload(false);
+        setStatusColor('RED');
+        setHudMessage(
+          err.message || 'Error al verificar enfoque de la cámara'
+        );
+        cooldownUntilRef.current = Date.now() + 1800;
+        stableTicksRef.current = 0;
+        setStableTicks(0);
+        if (!autoCaptureRef.current) {
+          Alert.alert('Aviso', err.message || 'No se pudo capturar la foto');
+        }
       }
     },
-    [token, onScanCompleted, triggerHardwareRefocus]
+    [token, triggerHardwareRefocus, analyzeCapturedPhoto]
   );
 
   // 1. Giroscopio para detectar movimientos mientras el lente enfoca
@@ -200,7 +360,13 @@ export const SmartCameraScreen: React.FC<Props> = ({
     if (!permission?.granted) return;
 
     const timer = setInterval(() => {
-      if (isCapturingRef.current || !isCameraReadyRef.current) return;
+      if (
+        isCapturingRef.current ||
+        !isCameraReadyRef.current ||
+        capturedPreviewUriRef.current
+      ) {
+        return;
+      }
       if (Date.now() < cooldownUntilRef.current) return;
 
       const isMoving =
@@ -216,7 +382,7 @@ export const SmartCameraScreen: React.FC<Props> = ({
       }
 
       const requiredTicks = detectedTedXmlRef.current
-        ? 3
+        ? 2
         : STABILITY_TICKS_REQUIRED;
 
       const nextTicks = Math.min(
@@ -233,7 +399,7 @@ export const SmartCameraScreen: React.FC<Props> = ({
         );
       } else {
         setStatusColor('GREEN');
-        setHudMessage('¡Enfoque bloqueado! Capturando en alta definición...');
+        setHudMessage('¡Pulso estable! Evaluando nitidez óptima...');
         if (autoCaptureRef.current && !isCapturingRef.current) {
           stableTicksRef.current = 0;
           setStableTicks(0);
@@ -271,56 +437,79 @@ export const SmartCameraScreen: React.FC<Props> = ({
 
   return (
     <View style={styles.container}>
-      <CameraView
-        ref={cameraRef}
-        style={StyleSheet.absoluteFill}
-        facing="back"
-        autofocus={autofocusMode}
-        zoom={zoom}
-        enableTorch={torchOn}
-        animateShutter={false}
-        barcodeScannerSettings={{
-          barcodeTypes: ['pdf417', 'qr', 'code128'],
-        }}
-        onBarcodeScanned={handleBarcodeScanned}
-        onCameraReady={() => {
-          isCameraReadyRef.current = true;
-        }}
-      />
+      {capturedPreviewUri ? (
+        <Image
+          source={{ uri: capturedPreviewUri }}
+          style={StyleSheet.absoluteFill}
+          resizeMode="cover"
+        />
+      ) : (
+        <CameraView
+          ref={cameraRef}
+          style={StyleSheet.absoluteFill}
+          facing="back"
+          autofocus={autofocusMode}
+          zoom={zoom}
+          enableTorch={torchOn}
+          animateShutter={false}
+          barcodeScannerSettings={{
+            barcodeTypes: ['pdf417', 'qr', 'code128'],
+          }}
+          onBarcodeScanned={handleBarcodeScanned}
+          onCameraReady={() => {
+            isCameraReadyRef.current = true;
+          }}
+        />
+      )}
 
       {/* Barra Superior */}
       <View style={styles.topBar}>
-        <TouchableOpacity style={styles.navBtn} onPress={onNavigateHistory}>
+        <TouchableOpacity
+          style={styles.navBtn}
+          onPress={onNavigateHistory}
+          disabled={isProcessingUpload}
+        >
           <Text style={styles.navBtnText}>← Historial</Text>
         </TouchableOpacity>
 
-        <TouchableOpacity
-          style={[styles.torchBtn, torchOn && styles.torchBtnActive]}
-          onPress={() => setTorchOn(!torchOn)}
-        >
-          <Text style={styles.torchBtnText}>
-            {torchOn ? 'Luz: ON' : 'Luz: OFF'}
-          </Text>
-        </TouchableOpacity>
+        {capturedPreviewUri ? (
+          <View style={styles.cameraOffBadge}>
+            <Text style={styles.cameraOffBadgeText}>
+              📷 Cámara apagada • Imagen fija
+            </Text>
+          </View>
+        ) : (
+          <>
+            <TouchableOpacity
+              style={[styles.torchBtn, torchOn && styles.torchBtnActive]}
+              onPress={() => setTorchOn(!torchOn)}
+            >
+              <Text style={styles.torchBtnText}>
+                {torchOn ? 'Luz: ON' : 'Luz: OFF'}
+              </Text>
+            </TouchableOpacity>
 
-        <View style={styles.autoSwitchRow}>
-          <Text style={styles.autoLabel}>Auto</Text>
-          <Switch
-            value={autoCapture}
-            onValueChange={(val) => {
-              setAutoCapture(val);
-              stableTicksRef.current = 0;
-              setStableTicks(0);
-            }}
-            trackColor={{ false: '#334155', true: '#0284C7' }}
-          />
-        </View>
+            <View style={styles.autoSwitchRow}>
+              <Text style={styles.autoLabel}>Auto</Text>
+              <Switch
+                value={autoCapture}
+                onValueChange={(val) => {
+                  setAutoCapture(val);
+                  stableTicksRef.current = 0;
+                  setStableTicks(0);
+                }}
+                trackColor={{ false: '#334155', true: '#0284C7' }}
+              />
+            </View>
+          </>
+        )}
       </View>
 
       {/* Marco ROI: Tocar el recuadro fuerza el reenfoque físico del lente */}
       <TouchableOpacity
         activeOpacity={0.9}
         onPress={triggerHardwareRefocus}
+        disabled={Boolean(capturedPreviewUri)}
         style={styles.roiWrapper}
       >
         <View style={[styles.roiFrame, { borderColor }]}>
@@ -332,38 +521,51 @@ export const SmartCameraScreen: React.FC<Props> = ({
               <Text style={styles.tedBadgeText}>{detectedTedLabel}</Text>
             </View>
           )}
+          {capturedPreviewUri && !uploadError && (
+            <View style={styles.freezeReleaseBanner}>
+              <Text style={styles.freezeReleaseTitle}>
+                ✓ ¡Enfoque óptimo capturado!
+              </Text>
+              <Text style={styles.freezeReleaseSubtitle}>
+                Ya puedes retirar la boleta o bajar el teléfono mientras
+                extraemos los datos con el OCR.
+              </Text>
+            </View>
+          )}
         </View>
       </TouchableOpacity>
 
-      {/* Selector de Zoom Macro para Boletas (Evita desenfoque por acercar demasiado el lente) */}
-      <View style={styles.zoomBar}>
-        {[
-          { label: '1.0x Normal', val: 0 },
-          { label: '1.3x Boletas (Óptimo)', val: 0.06 },
-          { label: '1.6x Detalle', val: 0.12 },
-        ].map((opt) => {
-          const active = Math.abs(zoom - opt.val) < 0.01;
-          return (
-            <TouchableOpacity
-              key={opt.label}
-              style={[styles.zoomPill, active && styles.zoomPillActive]}
-              onPress={() => {
-                setZoom(opt.val);
-                triggerHardwareRefocus();
-              }}
-            >
-              <Text
-                style={[
-                  styles.zoomPillText,
-                  active && styles.zoomPillTextActive,
-                ]}
+      {/* Selector de Zoom Macro para Boletas (Solo visible cuando la cámara está activa) */}
+      {!capturedPreviewUri && (
+        <View style={styles.zoomBar}>
+          {[
+            { label: '1.0x Normal', val: 0 },
+            { label: '1.3x Boletas (Óptimo)', val: 0.06 },
+            { label: '1.6x Detalle', val: 0.12 },
+          ].map((opt) => {
+            const active = Math.abs(zoom - opt.val) < 0.01;
+            return (
+              <TouchableOpacity
+                key={opt.label}
+                style={[styles.zoomPill, active && styles.zoomPillActive]}
+                onPress={() => {
+                  setZoom(opt.val);
+                  triggerHardwareRefocus();
+                }}
               >
-                {opt.label}
-              </Text>
-            </TouchableOpacity>
-          );
-        })}
-      </View>
+                <Text
+                  style={[
+                    styles.zoomPillText,
+                    active && styles.zoomPillTextActive,
+                  ]}
+                >
+                  {opt.label}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      )}
 
       {/* Panel Inferior de Telemetría y Disparo */}
       <View style={styles.bottomHud}>
@@ -375,31 +577,70 @@ export const SmartCameraScreen: React.FC<Props> = ({
               : 'PP-OCRv4 + CLAHE'}
           </Text>
           <Text style={styles.metricItem}>
-            Foco AF: {stableTicks}/{STABILITY_TICKS_REQUIRED}
+            {capturedPreviewUri
+              ? 'Estado: Captura Congelada'
+              : `Foco AF: ${stableTicks}/${STABILITY_TICKS_REQUIRED}`}
           </Text>
         </View>
 
         {isProcessingUpload ? (
           <View style={styles.processingBox}>
-            <ActivityIndicator size="large" color="#38BDF8" />
+            <ActivityIndicator size="large" color="#22C55E" />
             <Text style={styles.processingText}>
-              Aplicando filtro CLAHE, verificando nitidez y leyendo caracteres...
+              {detectedTedXmlRef.current
+                ? 'Imagen congelada • Validando Timbre SII y extrayendo datos...'
+                : 'Imagen congelada • Aplicando filtro CLAHE y ejecutando OCR + IA...'}
             </Text>
+          </View>
+        ) : capturedPreviewUri && uploadError ? (
+          <View style={styles.buttonsColumn}>
+            <TouchableOpacity
+              style={styles.shutterButton}
+              onPress={() =>
+                analyzeCapturedPhoto(capturedPreviewUri, capturedBlurScore)
+              }
+            >
+              <Text style={styles.shutterText}>
+                ↻ Reintentar análisis con esta misma foto
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.offlineSaveBtn}
+              onPress={handleSaveToOfflineQueue}
+            >
+              <Text style={styles.offlineSaveBtnText}>
+                💾 Guardar en cola sin conexión (Modo Offline)
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.forceButton}
+              onPress={discardCapturedPreview}
+            >
+              <Text style={styles.forceButtonText}>
+                Descartar y volver a la cámara
+              </Text>
+            </TouchableOpacity>
           </View>
         ) : (
           <View style={styles.buttonsColumn}>
             <TouchableOpacity
               style={styles.shutterButton}
+              disabled={isEvaluatingFocus}
               onPress={() => executeSmartCapture(false)}
             >
               <Text style={styles.shutterText}>
-                Capturar Ahora (Con Validación de Enfoque)
+                {isEvaluatingFocus
+                  ? 'Evaluando nitidez del texto...'
+                  : 'Capturar Ahora (Con Validación de Enfoque)'}
               </Text>
             </TouchableOpacity>
 
             {showForceButton && (
               <TouchableOpacity
                 style={styles.forceButton}
+                disabled={isEvaluatingFocus}
                 onPress={() => executeSmartCapture(true)}
               >
                 <Text style={styles.forceButtonText}>
@@ -476,6 +717,19 @@ const styles = StyleSheet.create({
   },
   autoSwitchRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   autoLabel: { color: '#E2E8F0', fontSize: 13, fontWeight: '600' },
+  cameraOffBadge: {
+    backgroundColor: 'rgba(34, 197, 94, 0.2)',
+    borderWidth: 1,
+    borderColor: '#22C55E',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+  },
+  cameraOffBadgeText: {
+    color: '#4ADE80',
+    fontWeight: '700',
+    fontSize: 12,
+  },
   roiWrapper: {
     flex: 1,
     justifyContent: 'center',
@@ -518,6 +772,32 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     fontSize: 12,
     textAlign: 'center',
+  },
+  freezeReleaseBanner: {
+    marginTop: 'auto',
+    marginBottom: 18,
+    marginHorizontal: 14,
+    backgroundColor: 'rgba(15, 23, 42, 0.92)',
+    borderWidth: 2,
+    borderColor: '#22C55E',
+    borderRadius: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  freezeReleaseTitle: {
+    color: '#4ADE80',
+    fontWeight: '800',
+    fontSize: 15,
+    marginBottom: 4,
+    textAlign: 'center',
+  },
+  freezeReleaseSubtitle: {
+    color: '#F8FAFC',
+    fontWeight: '600',
+    fontSize: 13,
+    textAlign: 'center',
+    lineHeight: 18,
   },
   zoomBar: {
     flexDirection: 'row',
@@ -582,6 +862,17 @@ const styles = StyleSheet.create({
   },
   forceButtonText: {
     color: '#38BDF8',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  offlineSaveBtn: {
+    backgroundColor: '#0284C7',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  offlineSaveBtnText: {
+    color: '#FFFFFF',
     fontWeight: '700',
     fontSize: 13,
   },

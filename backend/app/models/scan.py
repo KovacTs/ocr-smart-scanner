@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from sqlalchemy import (
     Column,
     DateTime,
@@ -7,6 +8,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     JSON,
+    Numeric,
     String,
     Text,
 )
@@ -35,7 +37,9 @@ class Scan(Base):
     current_raw_text = Column(Text, default="")
     current_normalized_data = Column(JSON, default=dict)
     issue_date = Column(String(32), nullable=True, index=True)  # ISO 8601 YYYY-MM-DD
-    total_amount = Column(Float, default=0.0)
+    total_amount = Column(Numeric(14, 2), default=Decimal("0.00"), nullable=False)
+    status = Column(String(32), default="COMPLETED", index=True, nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at = Column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False

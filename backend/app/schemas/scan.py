@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Any, List, Optional
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from app.core.security import create_signed_file_url
 
 
 class PartyInfo(BaseModel):
@@ -48,6 +49,8 @@ class ScanResponse(BaseModel):
     folio: Optional[str] = None
     image_url: str
     thumbnail_url: str
+    signed_image_url: Optional[str] = None
+    signed_thumbnail_url: Optional[str] = None
     original_size_bytes: int
     file_size_bytes: int
     blur_score: float
@@ -55,9 +58,23 @@ class ScanResponse(BaseModel):
     current_normalized_data: dict[str, Any]
     issue_date: Optional[str] = None
     total_amount: float
+    status: str = "COMPLETED"
+    deleted_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
     versions: List[ScanVersionResponse] = []
+
+    @model_validator(mode="after")
+    def populate_signed_urls(self) -> "ScanResponse":
+        if not self.signed_image_url and self.image_url:
+            self.signed_image_url = create_signed_file_url(
+                self.image_url, self.user_id, self.id, "document.webp"
+            )
+        if not self.signed_thumbnail_url and self.thumbnail_url:
+            self.signed_thumbnail_url = create_signed_file_url(
+                self.thumbnail_url, self.user_id, self.id, "thumbnail.webp"
+            )
+        return self
 
 
 class ScanUpdateRequest(BaseModel):
@@ -74,6 +91,11 @@ class BatchExportRequest(BaseModel):
 
 class BatchDeleteRequest(BaseModel):
     scan_ids: List[str]
+    permanent: bool = False
+
+
+class BatchRestoreRequest(BaseModel):
+    scan_ids: List[str]
 
 
 class FocusCheckResponse(BaseModel):
@@ -84,3 +106,4 @@ class FocusCheckResponse(BaseModel):
     roi_bbox: Optional[List[int]] = None
     status_color: str  # "RED", "YELLOW", "GREEN"
     message: str
+

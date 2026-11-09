@@ -18,12 +18,18 @@ app = FastAPI(
     ),
 )
 
+allowed_origins_list = [
+    origin.strip()
+    for origin in settings.ALLOWED_ORIGINS.split(",")
+    if origin.strip()
+] or ["http://localhost:8081"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=allowed_origins_list,
+    allow_credentials="*" not in allowed_origins_list,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 app.include_router(auth.router, prefix=settings.API_V1_STR)

@@ -2,11 +2,14 @@ export interface User {
   id: string;
   email: string;
   full_name: string;
+  google_id?: string | null;
+  avatar_url?: string | null;
   created_at: string;
 }
 
 export interface AuthResponse {
   access_token: string;
+  refresh_token?: string | null;
   token_type: string;
   user: User;
 }
@@ -52,6 +55,8 @@ export interface ScanItem {
   folio: string | null;
   image_url: string;
   thumbnail_url: string;
+  signed_image_url?: string | null;
+  signed_thumbnail_url?: string | null;
   original_size_bytes: number;
   file_size_bytes: number;
   blur_score: number;
@@ -59,9 +64,20 @@ export interface ScanItem {
   current_normalized_data: NormalizedDocumentData;
   issue_date: string | null;
   total_amount: number;
+  status?: 'PROCESSING' | 'COMPLETED' | 'FAILED';
+  deleted_at?: string | null;
   created_at: string;
   updated_at: string;
   versions: ScanVersion[];
+}
+
+export interface ScanStatusItem {
+  id: string;
+  status: 'PROCESSING' | 'COMPLETED' | 'FAILED';
+  folio?: string;
+  document_type?: string;
+  total_amount?: number;
+  issue_date?: string;
 }
 
 export interface FocusCheckResult {

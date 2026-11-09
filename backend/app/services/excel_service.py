@@ -3,6 +3,7 @@ from typing import Sequence
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from app.core.security import create_signed_file_url
 from app.models.scan import Scan
 
 
@@ -77,7 +78,14 @@ def generate_scans_excel(
         exempt_val = float(amounts.get("exempt_amount", 0.0) or 0.0)
         total_val = float(amounts.get("total_amount", scan.total_amount) or 0.0)
         currency = amounts.get("currency", "CLP")
-        full_image_url = f"{base_url.rstrip('/')}{scan.image_url}"
+        signed_rel_url = create_signed_file_url(
+            scan.image_url,
+            scan.user_id,
+            scan.id,
+            "document.webp",
+            expires_in=86400,  # 24h para revisión contable en Excel
+        )
+        full_image_url = f"{base_url.rstrip('/')}{signed_rel_url}"
 
         row_values = [
             folio,
