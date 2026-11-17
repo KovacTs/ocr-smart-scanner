@@ -144,6 +144,17 @@ PROJECT_NAME="Smart OCR Scanner API"
 SECRET_KEY=clave-secreta-jwt-super-segura-en-produccion-2026
 DOMAIN=:80
 
+# Base de datos relacional (PostgreSQL en Docker)
+POSTGRES_USER=ocr_user
+POSTGRES_PASSWORD=ocr_secure_password_2026
+POSTGRES_DB=ocr_scanner
+DATABASE_URL=postgresql://ocr_user:ocr_secure_password_2026@postgres:5432/ocr_scanner
+
+# Cola de tareas en segundo plano (Redis + Arq)
+REDIS_URL=redis://redis:6379/0
+USE_ASYNC_QUEUE=true
+
+# Almacenamiento en OCI Object Storage S3
 STORAGE_BACKEND=S3
 S3_ENDPOINT_URL=https://<TU_NAMESPACE>.compat.objectstorage.<TU_REGION>.oraclecloud.com
 S3_REGION_NAME=sa-santiago-1
@@ -151,7 +162,11 @@ S3_BUCKET_NAME=ocr-scanner-documents
 S3_ACCESS_KEY_ID=<TU_CUSTOMER_ACCESS_KEY>
 S3_SECRET_ACCESS_KEY=<TU_CUSTOMER_SECRET_KEY>
 
+# Motor OCR e Inteligencia
 LLM_PROVIDER=AUTO
+BLUR_THRESHOLD_DEFAULT=380.0
+WEBP_MAX_DIMENSION=2400
+WEBP_QUALITY=82
 ```
 
 ### 6.3 Levantar con Docker Compose
@@ -161,7 +176,16 @@ docker compose up --build -d
 
 ### 6.4 Validar
 ```bash
+# Verificar los 5 contenedores (postgres, redis, backend, worker, caddy)
 docker compose ps
+
+# Comprobar migraciones automáticas de Alembic en el backend
+docker compose logs -f backend
+
+# Comprobar el worker de OCR en segundo plano
+docker compose logs -f worker
+
+# Probar la respuesta de salud local
 curl http://localhost:8000/health
 ```
 

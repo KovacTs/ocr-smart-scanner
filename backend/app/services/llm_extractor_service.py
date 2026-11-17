@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import os
 import re
 from typing import Any, Optional
@@ -14,6 +15,8 @@ from app.services.ocr_normalizer import (
     parse_monetary_value,
     validate_rut_mod11,
 )
+
+logger = logging.getLogger("ocr_pipeline.llm")
 
 ALLOWED_DOCUMENT_TYPES = {
     "FACTURA_ELECTRONICA",
@@ -153,26 +156,35 @@ def _call_ollama_api(raw_text: str) -> Optional[dict[str, Any]]:
         return None
 
 
+import time
+
+_gemini_cooldown_until: float = 0.0
+
+
 def _call_gemini_api(
     raw_text: str, image_path: Optional[str] = None
 ) -> Optional[dict[str, Any]]:
     """
     Invoca a Google Gemini Flash API (Multimodal: Imagen WebP + Texto OCR) con salida JSON estructurada.
-    Soporta cascada automática de modelos Flash en caso de alta demanda temporal (503 / timeout).
+    Incluye circuit-breaker temporal (60s) ante caída/sobrecarga 503 o timeout para no ralentizar
+    escaneos consecutivos cuando el servicio externo no está disponible.
     """
+    global _gemini_cooldown_until
     api_key = settings.GEMINI_API_KEY.strip()
     if not api_key:
         return None
 
+    now = time.monotonic()
+    if now < _gemini_cooldown_until:
+        remaining = int(_gemini_cooldown_until - now)
+        logger.info(
+            f"⚡ [LLM Gemini] Circuit-breaker activo ({remaining}s restantes). Usando OCR heurístico directo."
+        )
+        return None
+
     candidate_models = [settings.GEMINI_MODEL]
-    for fallback in [
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3.1-flash-lite",
-        "gemini-flash-lite-latest",
-    ]:
-        if fallback not in candidate_models:
-            candidate_models.append(fallback)
+    if "gemini-flash-lite-latest" not in candidate_models:
+        candidate_models.append("gemini-flash-lite-latest")
 
     parts: list[dict[str, Any]] = [
         {
@@ -211,16 +223,26 @@ def _call_gemini_api(
         },
     }
 
-    timeout = httpx.Timeout(settings.LLM_TIMEOUT_SECONDS, connect=3.0)
-    for model_name in candidate_models:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model_name}:generateContent?key={api_key}"
-        )
-        try:
-            with httpx.Client(timeout=timeout) as client:
+    read_timeout = min(float(settings.LLM_TIMEOUT_SECONDS), 2.8)
+    timeout = httpx.Timeout(read_timeout, connect=1.5)
+    with httpx.Client(timeout=timeout) as client:
+        for model_name in candidate_models:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model_name}:generateContent?key={api_key}"
+            )
+            try:
                 resp = client.post(url, json=payload)
+                if resp.status_code in (400, 401, 403):
+                    logger.warning(
+                        f"⚠️ [LLM Gemini] HTTP {resp.status_code} (API Key inválida o sin permisos). Activando circuit-breaker 300s."
+                    )
+                    _gemini_cooldown_until = time.monotonic() + 300.0
+                    break
                 if resp.status_code != 200:
+                    logger.info(
+                        f"ℹ️ [LLM Gemini] Modelo {model_name} respondió HTTP {resp.status_code}, probando alternativa..."
+                    )
                     continue
                 body = resp.json()
                 candidates = body.get("candidates") or []
@@ -234,9 +256,18 @@ def _call_gemini_api(
                 if parsed:
                     parsed["_provider"] = f"GEMINI ({model_name})"
                     return parsed
-        except Exception:
-            continue
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as net_err:
+                logger.warning(
+                    f"⚠️ [LLM Gemini] Timeout/Red ({type(net_err).__name__}). Activando circuit-breaker 60s y usando OCR heurístico."
+                )
+                _gemini_cooldown_until = time.monotonic() + 60.0
+                break
+            except Exception as err:
+                logger.warning(f"⚠️ [LLM Gemini] Error invocando {model_name}: {err}")
+                break
 
+    if time.monotonic() >= _gemini_cooldown_until:
+        _gemini_cooldown_until = time.monotonic() + 60.0
     return None
 
 

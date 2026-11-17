@@ -38,7 +38,10 @@ services:
       dockerfile: Dockerfile
     container_name: ocr-backend
     restart: unless-stopped
+    env_file:
+      - ./backend/.env
     environment:
+      - PYTHONUNBUFFERED=1
       - PROJECT_NAME=Smart OCR Scanner API
       - DATABASE_URL=postgresql://${POSTGRES_USER:-ocr_user}:${POSTGRES_PASSWORD:-ocr_secure_password_2026}@postgres:5432/${POSTGRES_DB:-ocr_scanner}
       - REDIS_URL=redis://redis:6379/0
@@ -50,6 +53,7 @@ services:
       - LLM_PROVIDER=${LLM_PROVIDER:-AUTO}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://localhost:11434}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       # Almacenamiento Cloud compatible S3 (AWS S3 y Oracle Cloud OCI Object Storage)
       - STORAGE_BACKEND=${STORAGE_BACKEND:-LOCAL}
       - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-}
@@ -63,6 +67,9 @@ services:
     ports:
       # Exposición interna/directa si se requiere depuración
       - "8000:8000"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -82,7 +89,15 @@ services:
     container_name: ocr-worker
     restart: unless-stopped
     command: python -m app.worker
+    env_file:
+      - ./backend/.env
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    healthcheck:
+      disable: true
     environment:
+      - PYTHONUNBUFFERED=1
       - PROJECT_NAME=Smart OCR Scanner Worker
       - DATABASE_URL=postgresql://${POSTGRES_USER:-ocr_user}:${POSTGRES_PASSWORD:-ocr_secure_password_2026}@postgres:5432/${POSTGRES_DB:-ocr_scanner}
       - REDIS_URL=redis://redis:6379/0
@@ -111,6 +126,9 @@ services:
     image: caddy:2-alpine
     container_name: ocr-caddy
     restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     ports:
       - "80:80"
       - "443:443"

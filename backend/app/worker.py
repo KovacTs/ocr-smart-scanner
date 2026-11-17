@@ -1,11 +1,14 @@
 import asyncio
 import logging
+import sys
+import time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Optional
 from arq import create_pool
 from arq.connections import RedisSettings
 from app.core.config import settings
 from app.db.database import SessionLocal
+import app.models.user  # noqa: F401 - Requerido para resolver relationship("User") en Scan
 from app.models.scan import Scan, ScanVersion
 from app.services.ocr_normalizer import (
     extract_raw_text_from_image,
@@ -17,8 +20,14 @@ from app.services.sii_barcode_service import (
     parse_sii_ted_xml,
 )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+    force=True,
+)
 logger = logging.getLogger("ocr_worker")
-logging.basicConfig(level=logging.INFO)
 
 
 def _to_decimal_amount(raw_val: Any) -> Decimal:
@@ -42,27 +51,49 @@ async def process_ocr_scan_task(
     Ejecuta el procesamiento intensivo de CPU/GPU (Decodificación PDF417, RapidOCR, LLM)
     fuera del hilo HTTP principal de FastAPI para responder en < 200 ms.
     """
-    logger.info(f"[Worker] Iniciando procesamiento en segundo plano para Scan #{scan_id}")
+    t_start = time.perf_counter()
+    short_id = scan_id[:8]
+    logger.info(
+        f"🚀 [Worker Scan #{short_id}] Iniciando procesamiento OCR en segundo plano ({image_disk_path})"
+    )
     db = SessionLocal()
     try:
         scan = db.query(Scan).filter(Scan.id == scan_id).first()
         if not scan:
-            logger.error(f"[Worker] Escaneo {scan_id} no encontrado en base de datos.")
+            logger.error(f"❌ [Worker Scan #{short_id}] Escaneo {scan_id} no encontrado en BD.")
             return {"error": "SCAN_NOT_FOUND"}
 
+        t_ted = time.perf_counter()
         ted_from_client = parse_sii_ted_xml(sii_ted_xml) if sii_ted_xml else None
         ted_data = ted_from_client or decode_barcodes_from_image(image_disk_path)
+        ted_ms = int((time.perf_counter() - t_ted) * 1000)
+        if ted_data:
+            logger.info(
+                f"📊 [Worker Scan #{short_id}] Código SII detectado ({ted_data.get('source')}) en {ted_ms}ms -> "
+                f"Folio={ted_data.get('document_number')}, Total=${ted_data.get('amounts', {}).get('total_amount')}"
+            )
+        else:
+            logger.info(f"📊 [Worker Scan #{short_id}] Sin código de barras SII legible ({ted_ms}ms). Usando OCR visual.")
 
+        t_ocr = time.perf_counter()
         raw_text = extract_raw_text_from_image(
             image_path=image_disk_path,
             raw_text_hint=raw_text_hint,
         )
+        ocr_ms = int((time.perf_counter() - t_ocr) * 1000)
+        line_count = len([ln for ln in raw_text.splitlines() if ln.strip()])
+        logger.info(
+            f"🔍 [Worker Scan #{short_id}] OCR Visual completado en {ocr_ms}ms ({line_count} líneas extraídas)"
+        )
+
         has_full_ted = bool(ted_data and ted_data.get("source") == "SII_TED_PDF417")
+        t_norm = time.perf_counter()
         ocr_normalized = normalize_document_text(
             raw_text,
             image_path=None if raw_text_hint else image_disk_path,
             use_llm_fallback=not has_full_ted,
         )
+        norm_ms = int((time.perf_counter() - t_norm) * 1000)
         normalized_data = merge_sii_ted_with_ocr(ted_data, ocr_normalized)
 
         if has_full_ted:
@@ -111,8 +142,13 @@ async def process_ocr_scan_task(
             db.add(version_1)
 
         db.commit()
+        total_ms = int((time.perf_counter() - t_start) * 1000)
+        issuer_info = normalized_data.get("issuer", {})
         logger.info(
-            f"[Worker] Procesamiento completado para Scan #{scan_id}: Folio={scan.folio}, Total=${scan.total_amount}"
+            f"✅ [Worker Scan #{short_id}] COMPLETADO en {total_ms}ms (Norm/LLM: {norm_ms}ms, Método: {mod_by}) | "
+            f"Tipo={scan.document_type} | Folio={scan.folio} | "
+            f"RUT={issuer_info.get('tax_id') or 'S/RUT'} ({issuer_info.get('legal_name')}) | "
+            f"Total=${scan.total_amount}"
         )
         return {
             "status": "COMPLETED",
@@ -121,21 +157,67 @@ async def process_ocr_scan_task(
             "total_amount": float(scan.total_amount),
         }
     except Exception as e:
-        logger.exception(f"[Worker] Error en procesamiento de Scan #{scan_id}: {e}")
+        logger.exception(f"❌ [Worker Scan #{short_id}] Error en procesamiento: {e}")
         try:
             scan = db.query(Scan).filter(Scan.id == scan_id).first()
             if scan:
                 scan.status = "FAILED"
+                scan.folio = "ERROR_OCR"
                 db.commit()
-        except Exception:
-            pass
+        except Exception as db_err:
+            logger.error(f"❌ [Worker Scan #{short_id}] No se pudo actualizar estado FAILED: {db_err}")
         return {"status": "FAILED", "scan_id": scan_id, "error": str(e)}
     finally:
         db.close()
 
 
+async def recover_pending_scans_on_startup(ctx: dict) -> None:
+    """
+    Al iniciar el worker, revisa si quedaron escaneos atrapados en estado PROCESSING
+    (por ejemplo tras un reinicio de contenedor) y los procesa automáticamente.
+    """
+    db = SessionLocal()
+    try:
+        pending_scans = (
+            db.query(Scan)
+            .filter(Scan.status == "PROCESSING")
+            .order_by(Scan.created_at.asc())
+            .all()
+        )
+        if not pending_scans:
+            return
+        logger.info(
+            f"🔄 [Worker Recovery] Se encontraron {len(pending_scans)} escaneo(s) pendientes en cola. Procesando..."
+        )
+        items = [(s.id, s.user_id) for s in pending_scans]
+    except Exception as e:
+        logger.error(f"❌ [Worker Recovery] Error consultando escaneos pendientes: {e}")
+        return
+    finally:
+        db.close()
+
+    for scan_id, user_id in items:
+        disk_path = settings.UPLOADS_DIR / user_id / scan_id / "document.webp"
+        if disk_path.exists():
+            await process_ocr_scan_task(ctx, scan_id=scan_id, image_disk_path=str(disk_path))
+        else:
+            logger.warning(
+                f"⚠️ [Worker Recovery] Archivo no encontrado para Scan #{scan_id[:8]} ({disk_path}). Marcando FAILED."
+            )
+            db2 = SessionLocal()
+            try:
+                sc = db2.query(Scan).filter(Scan.id == scan_id).first()
+                if sc:
+                    sc.status = "FAILED"
+                    sc.folio = "ARCHIVO_NO_ENCONTRADO"
+                    db2.commit()
+            finally:
+                db2.close()
+
+
 class WorkerSettings:
     functions = [process_ocr_scan_task]
+    on_startup = recover_pending_scans_on_startup
     redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
     max_jobs = 4
     poll_delay = 0.5
@@ -146,3 +228,4 @@ if __name__ == "__main__":
 
     logger.info("Iniciando Arq Worker para OCR Smart Scanner...")
     run_worker(WorkerSettings)
+

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -59,6 +59,38 @@ export const ScanDetailScreen: React.FC<Props> = ({
   const [totalAmount, setTotalAmount] = useState(
     String(initialNorm.amounts?.total_amount || 0)
   );
+
+  // Si el escaneo aún está en cola ('PROCESSING'), consultar hasta que se complete
+  useEffect(() => {
+    if (scan.status !== 'PROCESSING' || !token) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const fresh = await apiClient.getScanDetail(token, scan.id);
+        if (fresh.status !== 'PROCESSING') {
+          onScanUpdated(fresh);
+          const norm =
+            fresh.versions?.[0]?.normalized_data ||
+            fresh.current_normalized_data;
+          if (norm) {
+            setDocType(norm.document_type || 'FACTURA_ELECTRONICA');
+            setFolio(norm.document_number || '');
+            setIssueDate(norm.issue_date || '');
+            setIssuerRut(norm.issuer?.tax_id || '');
+            setIssuerName(norm.issuer?.legal_name || '');
+            setReceiverRut(norm.receiver?.tax_id || '');
+            setNetAmount(String(norm.amounts?.net_amount || 0));
+            setTaxAmount(String(norm.amounts?.tax_amount || 0));
+            setTotalAmount(String(norm.amounts?.total_amount || 0));
+          }
+        }
+      } catch {
+        // Reintentar en el siguiente ciclo
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [scan.id, scan.status, token, onScanUpdated]);
 
   const loadVersionData = (idx: number) => {
     setSelectedVersionIdx(idx);

@@ -1,3 +1,5 @@
+import logging
+import sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api import auth, scans
@@ -5,6 +7,14 @@ from app.core.config import settings
 from app.db.database import Base, engine
 import app.models.user  # noqa: F401
 import app.models.scan  # noqa: F401
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+    force=True,
+)
 
 Base.metadata.create_all(bind=engine)
 

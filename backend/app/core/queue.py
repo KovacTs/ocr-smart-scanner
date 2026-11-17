@@ -33,7 +33,7 @@ async def enqueue_scan_job(
                 raw_text_hint,
                 sii_ted_xml,
             )
-            await redis_pool.close()
+            await redis_pool.aclose()
             logger.info(f"[Queue] Trabajo encolado exitosamente en Redis para Scan #{scan_id}")
             return True
         except Exception as e:

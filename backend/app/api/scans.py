@@ -1,4 +1,6 @@
+import logging
 import shutil
+import time
 import uuid
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, List, Optional
@@ -44,6 +46,8 @@ from app.services.sii_barcode_service import (
     parse_sii_ted_xml,
 )
 from app.services.vision_service import analyze_focus_and_roi, optimize_and_save_webp
+
+logger = logging.getLogger("ocr_pipeline")
 
 router = APIRouter(prefix="/scans", tags=["Escaneos, Enfoque, Normalización y Excel"])
 
@@ -113,9 +117,15 @@ async def evaluate_camera_focus(
     2. Calcula la Varianza del Laplaciano exclusivamente sobre el ROI.
     3. Devuelve el semáforo de estado (RED, YELLOW, GREEN) para disparo asistido / auto-captura.
     """
+    t0 = time.perf_counter()
     image_bytes = await file.read()
     _validate_image_magic_bytes(image_bytes)
     result = analyze_focus_and_roi(image_bytes, threshold=threshold)
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    logger.info(
+        f"📸 [Enfoque] Score={result['blur_score']:.0f}/{result['threshold']:.0f} | "
+        f"Estado={result['status_color']} | Doc={result['document_detected']} ({elapsed_ms}ms)"
+    )
     return FocusCheckResponse(**result)
 
 
@@ -140,6 +150,10 @@ async def create_scan(
     3. Si async_mode=True: guarda el registro con status="PROCESSING", encola la tarea en Redis+Arq y responde en <200ms.
     4. Si async_mode=False (síncrono): ejecuta OCR visual, Timbre SII y LLM en el ciclo de petición.
     """
+    t_pipeline_start = time.perf_counter()
+    scan_id = str(uuid.uuid4())
+    short_id = scan_id[:8]
+
     image_bytes = await file.read()
     _validate_image_magic_bytes(image_bytes)
     ted_from_client = parse_sii_ted_xml(sii_ted_xml) if sii_ted_xml else None
@@ -163,6 +177,10 @@ async def create_scan(
         focus_info = analyze_focus_and_roi(image_bytes, threshold=blur_threshold)
 
     if not force_capture and not focus_info["is_focused"] and ted_from_client is None:
+        logger.warning(
+            f"⚠️ [Scan #{short_id}] Imagen rechazada por desenfoque "
+            f"(Score={focus_info['blur_score']:.0f} < Umbral={focus_info['threshold']:.0f})"
+        )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={
@@ -175,15 +193,22 @@ async def create_scan(
             },
         )
 
-    scan_id = str(uuid.uuid4())
+    t_webp = time.perf_counter()
     storage_info = optimize_and_save_webp(
         image_bytes=image_bytes,
         user_id=current_user.id,
         scan_id=scan_id,
     )
+    webp_ms = int((time.perf_counter() - t_webp) * 1000)
+    orig_kb = round(storage_info["original_size_bytes"] / 1024, 1)
+    webp_kb = round(storage_info["file_size_bytes"] / 1024, 1)
+    logger.info(
+        f"🚀 [Scan #{short_id} - 1/4] Imagen recibida ({orig_kb}KB -> WebP {webp_kb}KB en {webp_ms}ms) | "
+        f"BlurScore={focus_info['blur_score']}"
+    )
 
-    # Modo Asíncrono: Encolar a Redis/Arq y responder de inmediato
-    if async_mode or settings.USE_ASYNC_QUEUE:
+    # Modo Asíncrono: Encolar a Redis/Arq cuando el cliente solicita async_mode=True
+    if async_mode:
         scan = Scan(
             id=scan_id,
             user_id=current_user.id,
@@ -204,6 +229,9 @@ async def create_scan(
         db.commit()
         db.refresh(scan)
 
+        logger.info(
+            f"⏳ [Scan #{short_id}] Encolando trabajo en Redis/Arq para procesamiento asíncrono..."
+        )
         await enqueue_scan_job(
             scan_id=scan_id,
             image_disk_path=storage_info["main_disk_path"],
@@ -212,20 +240,40 @@ async def create_scan(
         )
         return ScanResponse.model_validate(scan)
 
+    t_ted = time.perf_counter()
     ted_data = ted_from_client or decode_barcodes_from_image(
         storage_info["main_disk_path"]
     )
+    ted_ms = int((time.perf_counter() - t_ted) * 1000)
+    if ted_data:
+        logger.info(
+            f"📊 [Scan #{short_id} - 2/4] Código SII detectado ({ted_data.get('source')}) en {ted_ms}ms -> "
+            f"Folio={ted_data.get('document_number')}, Total=${ted_data.get('amounts', {}).get('total_amount')}"
+        )
+    else:
+        logger.info(
+            f"📊 [Scan #{short_id} - 2/4] Sin código de barras SII legible ({ted_ms}ms). Continuando con OCR visual..."
+        )
 
+    t_ocr = time.perf_counter()
     raw_text = extract_raw_text_from_image(
         image_path=storage_info["main_disk_path"],
         raw_text_hint=raw_text_hint,
     )
+    ocr_ms = int((time.perf_counter() - t_ocr) * 1000)
+    line_count = len([ln for ln in raw_text.splitlines() if ln.strip()])
+    logger.info(
+        f"🔍 [Scan #{short_id} - 3/4] OCR Visual (CLAHE + PP-OCRv4) completado en {ocr_ms}ms ({line_count} líneas extraídas)"
+    )
+
     has_full_ted = bool(ted_data and ted_data.get("source") == "SII_TED_PDF417")
+    t_norm = time.perf_counter()
     ocr_normalized = normalize_document_text(
         raw_text,
         image_path=None if raw_text_hint else storage_info["main_disk_path"],
         use_llm_fallback=not has_full_ted,
     )
+    norm_ms = int((time.perf_counter() - t_norm) * 1000)
     normalized_data = merge_sii_ted_with_ocr(ted_data, ocr_normalized)
 
     if has_full_ted:
@@ -275,6 +323,15 @@ async def create_scan(
     db.add(version_1)
     db.commit()
     db.refresh(scan)
+
+    total_ms = int((time.perf_counter() - t_pipeline_start) * 1000)
+    issuer_info = normalized_data.get("issuer", {})
+    logger.info(
+        f"✅ [Scan #{short_id} - 4/4] COMPLETADO en {total_ms}ms (Norm/LLM: {norm_ms}ms, Método: {mod_by}) | "
+        f"Tipo={scan.document_type} | Folio={scan.folio} | "
+        f"RUT={issuer_info.get('tax_id') or 'S/RUT'} ({issuer_info.get('legal_name')}) | "
+        f"Total=${scan.total_amount}"
+    )
 
     return ScanResponse.model_validate(scan)
 

@@ -3,19 +3,31 @@ import {
   ActivityIndicator,
   Alert,
   Modal,
-  ScrollView,
+  Platform,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
+import * as Linking from 'expo-linking';
+import * as WebBrowser from 'expo-web-browser';
+import * as Google from 'expo-auth-session/providers/google';
 import {
   apiClient,
   getApiBaseUrl,
   setCustomApiBaseUrl,
 } from '../api/client';
 import { useAuth } from '../context/AuthContext';
+
+// Permite cerrar automáticamente el navegador tras completar la redirección OAuth2
+WebBrowser.maybeCompleteAuthSession();
+
+const GOOGLE_CLIENT_ID = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID || '';
+// URI HTTPS autorizada en Google Cloud Console para clientes tipo "Aplicación Web" (evita Error 400 Custom Scheme en Expo Go)
+const GOOGLE_EXPO_PROXY_REDIRECT_URI =
+  process.env.EXPO_PUBLIC_GOOGLE_REDIRECT_URI ||
+  'https://auth.expo.io/@tu-usuario-expo/ocr-smart-scanner';
 
 export const AuthScreen: React.FC = () => {
   const { login, register, loginWithGoogle, isBiometricsSupported } = useAuth();
@@ -25,7 +37,14 @@ export const AuthScreen: React.FC = () => {
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
-  // Modal interactivo de autenticación y vinculación con Google (Fase 2)
+  // Hook oficial de Google OAuth2 para entorno Web
+  const [request, response, promptAsync] = Google.useIdTokenAuthRequest({
+    clientId: GOOGLE_CLIENT_ID,
+    webClientId: GOOGLE_CLIENT_ID,
+    selectAccount: true,
+  });
+
+  // Modal alternativo para prueba local rápida si se requiere
   const [showGoogleModal, setShowGoogleModal] = useState(false);
   const [googleEmailInput, setGoogleEmailInput] = useState('');
   const [googleNameInput, setGoogleNameInput] = useState('');
@@ -54,6 +73,44 @@ export const AuthScreen: React.FC = () => {
   useEffect(() => {
     verifyConnection();
   }, [verifyConnection]);
+
+  const handleGoogleTokenSuccess = useCallback(
+    async (idToken: string) => {
+      setSubmitting(true);
+      try {
+        await loginWithGoogle(idToken);
+      } catch (err: any) {
+        await verifyConnection();
+        Alert.alert(
+          'Error al autenticar',
+          err.message || 'No se pudo iniciar sesión con Google.'
+        );
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    [loginWithGoogle, verifyConnection]
+  );
+
+  // Escuchar respuesta cuando el usuario vuelve de la ventana oficial de Google (Web)
+  useEffect(() => {
+    if (response?.type === 'success') {
+      const token =
+        response.params?.id_token ||
+        response.authentication?.idToken ||
+        response.params?.access_token ||
+        response.authentication?.accessToken;
+      if (token) {
+        handleGoogleTokenSuccess(token);
+      }
+    } else if (response?.type === 'error') {
+      Alert.alert(
+        'Error de Google',
+        response.error?.message ||
+          'No se pudo completar el inicio de sesión con Google.'
+      );
+    }
+  }, [response, handleGoogleTokenSuccess]);
 
   const handleApplyServerUrl = async () => {
     const updated = setCustomApiBaseUrl(customUrlInput);
@@ -95,6 +152,105 @@ export const AuthScreen: React.FC = () => {
       Alert.alert('Error de autenticación', err.message || 'Intenta nuevamente');
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleGoogleSignInPress = async () => {
+    if (!GOOGLE_CLIENT_ID) {
+      openGoogleModal();
+      return;
+    }
+    try {
+      if (Platform.OS === 'web') {
+        await promptAsync();
+        return;
+      }
+
+      // 1. Generamos un sessionId único para recuperar el id_token desde el backend
+      //    incluso si Chrome en Android bloquea la redirección directa exp:// o el usuario vuelve manualmente.
+      const appReturnUrl = Linking.createURL('auth');
+      const sessionId =
+        Math.random().toString(36).substring(2, 15) +
+        Math.random().toString(36).substring(2, 15);
+      const nonce =
+        Math.random().toString(36).substring(2, 15) +
+        Math.random().toString(36).substring(2, 15);
+
+      const apiBase = getApiBaseUrl();
+      const backendCallbackUrl = `${apiBase}/auth/google/expo-callback?session_id=${encodeURIComponent(
+        sessionId
+      )}&app_url=${encodeURIComponent(appReturnUrl)}`;
+
+      const googleParams = new URLSearchParams({
+        client_id: GOOGLE_CLIENT_ID,
+        redirect_uri: GOOGLE_EXPO_PROXY_REDIRECT_URI,
+        response_type: 'id_token',
+        scope: 'openid email profile',
+        nonce,
+        prompt: 'select_account',
+      });
+
+      const googleAuthUrl = `https://accounts.google.com/o/oauth2/v2/auth?${googleParams.toString()}`;
+      // auth.expo.io redirige por HTTP estándar a nuestro backend (/auth/google/expo-callback),
+      // evitando el bloqueo de esquemas exp:// de Chrome en Android.
+      const proxyStartUrl = `${GOOGLE_EXPO_PROXY_REDIRECT_URI}/start?authUrl=${encodeURIComponent(
+        googleAuthUrl
+      )}&returnUrl=${encodeURIComponent(backendCallbackUrl)}`;
+
+      const result = await WebBrowser.openAuthSessionAsync(
+        proxyStartUrl,
+        appReturnUrl
+      );
+
+      let capturedToken: string | null = null;
+
+      if (result.type === 'success' && result.url) {
+        const hashPart = result.url.includes('#')
+          ? result.url.split('#')[1]
+          : '';
+        const queryPart = result.url.includes('?')
+          ? result.url.split('?')[1].split('#')[0]
+          : '';
+        const hashParams = new URLSearchParams(hashPart);
+        const queryParams = new URLSearchParams(queryPart);
+
+        capturedToken =
+          hashParams.get('id_token') ||
+          queryParams.get('id_token') ||
+          hashParams.get('access_token') ||
+          queryParams.get('access_token');
+      }
+
+      // Si Chrome regresó cerrando la pestaña o vía Intent sin adjuntar el hash,
+      // recuperamos el id_token capturado por el puente HTTP del backend.
+      if (!capturedToken) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const sessionRes = await fetch(
+              `${apiBase}/auth/google/expo-session/${encodeURIComponent(sessionId)}`
+            );
+            if (sessionRes.ok) {
+              const sessionData = await sessionRes.json();
+              if (sessionData?.ready && sessionData?.id_token) {
+                capturedToken = sessionData.id_token;
+                break;
+              }
+            }
+          } catch {
+            // Ignorar reintento
+          }
+          await new Promise((r) => setTimeout(r, 400));
+        }
+      }
+
+      if (capturedToken) {
+        await handleGoogleTokenSuccess(capturedToken);
+      }
+    } catch (err: any) {
+      Alert.alert(
+        'Error al abrir Google Sign-In',
+        err.message || 'No se pudo abrir el navegador de autenticación.'
+      );
     }
   };
 
@@ -274,9 +430,19 @@ export const AuthScreen: React.FC = () => {
         </View>
 
         <TouchableOpacity
-          style={styles.googleButton}
-          onPress={openGoogleModal}
-          disabled={submitting}
+          style={[
+            styles.googleButton,
+            (Platform.OS === 'web' && !request && Boolean(GOOGLE_CLIENT_ID)) ||
+            submitting
+              ? { opacity: 0.65 }
+              : null,
+          ]}
+          onPress={handleGoogleSignInPress}
+          onLongPress={openGoogleModal}
+          disabled={
+            (Platform.OS === 'web' && !request && Boolean(GOOGLE_CLIENT_ID)) ||
+            submitting
+          }
         >
           <Text style={styles.googleButtonText}>🌐 Iniciar Sesión con Google</Text>
         </TouchableOpacity>

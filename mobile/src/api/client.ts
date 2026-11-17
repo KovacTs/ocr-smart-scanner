@@ -305,6 +305,14 @@ export const apiClient = {
     return res.json();
   },
 
+  async getScanDetail(token: string, scanId: string): Promise<ScanItem> {
+    const res = await fetch(`${getApiBaseUrl()}/scans/${scanId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error('Error al cargar detalle del escaneo');
+    return res.json();
+  },
+
   async listScans(
     token: string,
     params?: {

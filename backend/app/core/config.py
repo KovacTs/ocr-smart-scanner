@@ -75,6 +75,11 @@ class Settings(BaseSettings):
 settings = Settings()
 settings.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-if settings.DATABASE_URL.startswith("sqlite:///"):
+if settings.DATABASE_URL.startswith("postgresql://"):
+    settings.DATABASE_URL = settings.DATABASE_URL.replace(
+        "postgresql://", "postgresql+psycopg2://", 1
+    )
+elif settings.DATABASE_URL.startswith("sqlite:///"):
     db_raw_path = settings.DATABASE_URL.replace("sqlite:///", "")
     Path(db_raw_path).parent.mkdir(parents=True, exist_ok=True)
+

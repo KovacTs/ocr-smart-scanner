@@ -2,6 +2,7 @@
   "expo": {
     "name": "Smart OCR Scanner",
     "slug": "ocr-smart-scanner",
+    "scheme": "ocrsmartscanner",
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",

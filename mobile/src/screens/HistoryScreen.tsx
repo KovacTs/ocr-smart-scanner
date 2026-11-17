@@ -39,32 +39,49 @@ export const HistoryScreen: React.FC<Props> = ({
   const [restoring, setRestoring] = useState<boolean>(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
 
-  const fetchScans = useCallback(async () => {
-    if (!token) return;
-    setLoading(true);
-    try {
-      const [list, pending] = await Promise.all([
-        apiClient.listScans(token, {
-          search: search.trim() || undefined,
-          only_deleted: viewTrash,
-        }),
-        offlineQueue.getPendingScans(),
-      ]);
-      setScans(list);
-      setOfflineItems(pending);
-      setSelectedIds((prev) =>
-        prev.filter((id) => list.some((s) => s.id === id))
-      );
-    } catch (err: any) {
-      Alert.alert('Error', err.message || 'No se pudo cargar el historial');
-    } finally {
-      setLoading(false);
-    }
-  }, [token, search, viewTrash]);
+  const fetchScans = useCallback(
+    async (silent = false) => {
+      if (!token) return;
+      if (!silent) setLoading(true);
+      try {
+        const [list, pending] = await Promise.all([
+          apiClient.listScans(token, {
+            search: search.trim() || undefined,
+            only_deleted: viewTrash,
+          }),
+          offlineQueue.getPendingScans(),
+        ]);
+        setScans(list);
+        setOfflineItems(pending);
+        setSelectedIds((prev) =>
+          prev.filter((id) => list.some((s) => s.id === id))
+        );
+      } catch (err: any) {
+        if (!silent) {
+          Alert.alert('Error', err.message || 'No se pudo cargar el historial');
+        }
+      } finally {
+        if (!silent) setLoading(false);
+      }
+    },
+    [token, search, viewTrash]
+  );
 
   useEffect(() => {
-    fetchScans();
+    fetchScans(false);
   }, [fetchScans]);
+
+  // Auto-refresco cada 2.5s mientras existan documentos en cola ('PROCESSING')
+  useEffect(() => {
+    const hasProcessing = scans.some((s) => s.status === 'PROCESSING');
+    if (!hasProcessing || !token) return;
+
+    const interval = setInterval(() => {
+      fetchScans(true);
+    }, 2500);
+
+    return () => clearInterval(interval);
+  }, [scans, token, fetchScans]);
 
   const handleSyncOffline = async () => {
     if (!token || syncingOffline) return;
