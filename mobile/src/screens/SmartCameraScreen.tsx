@@ -48,7 +48,7 @@ export const SmartCameraScreen: React.FC<Props> = ({
     'Toque el recuadro para reenfocar • Mantenga a ~18cm'
   );
   const [blurScore, setBlurScore] = useState<number>(0);
-  const [threshold, setThreshold] = useState<number>(380);
+  const [threshold, setThreshold] = useState<number>(240);
   const [stableTicks, setStableTicks] = useState<number>(0);
   const [isEvaluatingFocus, setIsEvaluatingFocus] = useState<boolean>(false);
   const [isProcessingUpload, setIsProcessingUpload] = useState<boolean>(false);
@@ -72,6 +72,8 @@ export const SmartCameraScreen: React.FC<Props> = ({
   const autoCaptureRef = useRef<boolean>(autoCapture);
   const detectedTedXmlRef = useRef<string>('');
   const capturedPreviewUriRef = useRef<string | null>(null);
+  const focusAttemptsRef = useRef<number>(0);
+  const consecutiveErrorsRef = useRef<number>(0);
 
   useEffect(() => {
     autoCaptureRef.current = autoCapture;
@@ -113,13 +115,15 @@ export const SmartCameraScreen: React.FC<Props> = ({
    * Fuerza al motor físico del lente de la cámara a re-escanear la distancia focal
    * alternando autofocus off -> on.
    */
-  const triggerHardwareRefocus = useCallback(() => {
+  const triggerHardwareRefocus = useCallback((updateHud = true) => {
     if (capturedPreviewUriRef.current) return;
     setAutofocusMode('off');
     stableTicksRef.current = 0;
     setStableTicks(0);
-    setStatusColor('YELLOW');
-    setHudMessage('Ajustando lente de enfoque óptico...');
+    if (updateHud) {
+      setStatusColor('YELLOW');
+      setHudMessage('Ajustando lente de enfoque óptico...');
+    }
     setTimeout(() => {
       setAutofocusMode('on');
     }, 120);
@@ -137,6 +141,8 @@ export const SmartCameraScreen: React.FC<Props> = ({
     setCapturedBlurScore(undefined);
     stableTicksRef.current = 0;
     setStableTicks(0);
+    focusAttemptsRef.current = 0;
+    consecutiveErrorsRef.current = 0;
     setStatusColor('GREEN');
     setHudMessage('Toque el recuadro para reenfocar • Mantenga a ~18cm');
     cooldownUntilRef.current = Date.now() + 800;
@@ -236,8 +242,8 @@ export const SmartCameraScreen: React.FC<Props> = ({
   /**
    * Flujo en 3 fases:
    * 1. Toma frame cuando el pulso está estable.
-   * 2. Evalúa nitidez del texto en /evaluate-focus (~100ms). Si está borroso, reenfoca sin congelar.
-   * 3. Apenas el enfoque es óptimo, CONGELA la foto en pantalla, APAGA la cámara/flash y lanza el OCR.
+   * 2. Evalúa nitidez del texto en /evaluate-focus (~100ms). Si tras reintentar hay documento encuadrado, captura sin quedar en bucle.
+   * 3. Apenas el enfoque es aceptado, CONGELA la foto en pantalla, APAGA la cámara/flash y lanza el OCR.
    */
   const executeSmartCapture = useCallback(
     async (forceCapture = false) => {
@@ -254,7 +260,11 @@ export const SmartCameraScreen: React.FC<Props> = ({
       isCapturingRef.current = true;
       setIsEvaluatingFocus(true);
       setStatusColor('GREEN');
-      setHudMessage('Verificando enfoque óptimo del texto...');
+      setHudMessage(
+        forceCapture
+          ? 'Capturando comprobante...'
+          : 'Verificando enfoque óptimo del texto...'
+      );
 
       try {
         const photo = await cameraRef.current.takePictureAsync({
@@ -274,11 +284,13 @@ export const SmartCameraScreen: React.FC<Props> = ({
             token,
             photo.uri
           );
+          consecutiveErrorsRef.current = 0;
           setBlurScore(focusCheck.blur_score);
           setThreshold(focusCheck.threshold);
           validatedScore = focusCheck.blur_score;
 
           if (!focusCheck.document_detected) {
+            focusAttemptsRef.current = 0;
             setStatusColor('RED');
             setHudMessage(
               focusCheck.message || 'Apunte al texto de la boleta o factura'
@@ -291,18 +303,28 @@ export const SmartCameraScreen: React.FC<Props> = ({
             return;
           }
 
-          if (!focusCheck.is_focused) {
+          focusAttemptsRef.current += 1;
+          const attempt = focusAttemptsRef.current;
+          // Aceptación progresiva: en el intento 1 exige el umbral completo; en el intento 2 acepta >=50% del umbral;
+          // en el intento 3 captura automáticamente si el documento está encuadrado para jamás quedar en bucle infinito.
+          const isAcceptableFocus =
+            focusCheck.is_focused ||
+            (attempt >= 2 &&
+              focusCheck.blur_score >= focusCheck.threshold * 0.5) ||
+            attempt >= 3;
+
+          if (!isAcceptableFocus) {
             setStatusColor('YELLOW');
             setShowForceButton(true);
             setHudMessage(
-              `Foco insuficiente (${focusCheck.blur_score.toFixed(
+              `Reenfocando (${focusCheck.blur_score.toFixed(
                 0
               )}/${focusCheck.threshold.toFixed(
                 0
-              )}) — Aléjese a ~18cm o use 1.3x`
+              )}) — Mantenga firme un instante...`
             );
-            triggerHardwareRefocus();
-            cooldownUntilRef.current = Date.now() + 1300;
+            triggerHardwareRefocus(false);
+            cooldownUntilRef.current = Date.now() + 950;
             isCapturingRef.current = false;
             setIsEvaluatingFocus(false);
             return;
@@ -310,6 +332,8 @@ export const SmartCameraScreen: React.FC<Props> = ({
         }
 
         // Fase B: ¡Enfoque óptimo confirmado! Congelar imagen en pantalla y apagar cámara + linterna
+        focusAttemptsRef.current = 0;
+        consecutiveErrorsRef.current = 0;
         if (Platform.OS !== 'web') {
           Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
         }
@@ -324,13 +348,20 @@ export const SmartCameraScreen: React.FC<Props> = ({
       } catch (err: any) {
         setIsEvaluatingFocus(false);
         isCapturingRef.current = false;
+        consecutiveErrorsRef.current += 1;
         setStatusColor('RED');
+        setShowForceButton(true);
         setHudMessage(
           err.message || 'Error al verificar enfoque de la cámara'
         );
-        cooldownUntilRef.current = Date.now() + 1800;
+        cooldownUntilRef.current = Date.now() + 2200;
         stableTicksRef.current = 0;
         setStableTicks(0);
+        // Si falla 2 veces seguidas la verificación (ej. problema de red), pausar Auto para evitar bucle
+        if (consecutiveErrorsRef.current >= 2 && autoCaptureRef.current) {
+          setAutoCapture(false);
+          autoCaptureRef.current = false;
+        }
         if (!autoCaptureRef.current) {
           Alert.alert('Aviso', err.message || 'No se pudo capturar la foto');
         }
@@ -497,6 +528,8 @@ export const SmartCameraScreen: React.FC<Props> = ({
                   setAutoCapture(val);
                   stableTicksRef.current = 0;
                   setStableTicks(0);
+                  focusAttemptsRef.current = 0;
+                  consecutiveErrorsRef.current = 0;
                 }}
                 trackColor={{ false: '#334155', true: '#0284C7' }}
               />
@@ -508,7 +541,7 @@ export const SmartCameraScreen: React.FC<Props> = ({
       {/* Marco ROI: Tocar el recuadro fuerza el reenfoque físico del lente */}
       <TouchableOpacity
         activeOpacity={0.9}
-        onPress={triggerHardwareRefocus}
+        onPress={() => triggerHardwareRefocus(true)}
         disabled={Boolean(capturedPreviewUri)}
         style={styles.roiWrapper}
       >
@@ -550,7 +583,7 @@ export const SmartCameraScreen: React.FC<Props> = ({
                 style={[styles.zoomPill, active && styles.zoomPillActive]}
                 onPress={() => {
                   setZoom(opt.val);
-                  triggerHardwareRefocus();
+                  triggerHardwareRefocus(true);
                 }}
               >
                 <Text
@@ -628,12 +661,12 @@ export const SmartCameraScreen: React.FC<Props> = ({
             <TouchableOpacity
               style={styles.shutterButton}
               disabled={isEvaluatingFocus}
-              onPress={() => executeSmartCapture(false)}
+              onPress={() => executeSmartCapture(true)}
             >
               <Text style={styles.shutterText}>
                 {isEvaluatingFocus
-                  ? 'Evaluando nitidez del texto...'
-                  : 'Capturar Ahora (Con Validación de Enfoque)'}
+                  ? 'Procesando captura...'
+                  : '📸 Capturar Ahora'}
               </Text>
             </TouchableOpacity>
 

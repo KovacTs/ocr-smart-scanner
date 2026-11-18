@@ -15,8 +15,8 @@ class Settings(BaseSettings):
         "SECRET_KEY", "super-secret-ocr-jwt-key-change-in-production-2026"
     )
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours access token
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 30  # 30 days refresh token
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days access token
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 60  # 60 days refresh token
     SIGNED_URL_EXPIRE_SECONDS: int = 900  # 15 minutes for ephemeral signed file URLs
     ALLOWED_ORIGINS: str = os.getenv(
         "ALLOWED_ORIGINS",
@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     S3_PRESIGN_EXPIRATION_SECONDS: int = 3600
 
     # Parámetros del Pipeline de Enfoque y WebP
-    BLUR_THRESHOLD_DEFAULT: float = 380.0
+    BLUR_THRESHOLD_DEFAULT: float = 240.0
     WEBP_MAX_DIMENSION: int = 2400
     WEBP_QUALITY: int = 82
     THUMBNAIL_WIDTH: int = 400
@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "qwen2.5:3b"
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-3.8-flash"
+    GEMINI_MODEL: str = "gemini-flash-lite-latest"
     LLM_TIMEOUT_SECONDS: float = 6.0
 
     # Configuración de Cola Asíncrona (Redis + Arq)

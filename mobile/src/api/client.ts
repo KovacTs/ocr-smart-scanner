@@ -108,6 +108,76 @@ export async function compressToWebPClientSide(
   return result;
 }
 
+export interface SessionHandler {
+  getRefreshToken: () => Promise<string | null>;
+  onSessionRefreshed: (auth: AuthResponse) => Promise<void>;
+  onSessionExpired: () => Promise<void>;
+}
+
+let sessionHandler: SessionHandler | null = null;
+let ongoingRefreshPromise: Promise<string | null> | null = null;
+let latestAccessTokenOverride: string | null = null;
+
+export function registerSessionHandler(handler: SessionHandler): void {
+  sessionHandler = handler;
+}
+
+export function clearAccessTokenOverride(): void {
+  latestAccessTokenOverride = null;
+}
+
+async function tryRefreshAccessToken(): Promise<string | null> {
+  if (!sessionHandler) return null;
+  if (ongoingRefreshPromise) return ongoingRefreshPromise;
+
+  ongoingRefreshPromise = (async () => {
+    try {
+      const refreshToken = await sessionHandler!.getRefreshToken();
+      if (!refreshToken) {
+        await sessionHandler!.onSessionExpired();
+        return null;
+      }
+      const res = await fetch(`${getApiBaseUrl()}/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+      if (!res.ok) {
+        await sessionHandler!.onSessionExpired();
+        return null;
+      }
+      const data: AuthResponse = await res.json();
+      latestAccessTokenOverride = data.access_token;
+      await sessionHandler!.onSessionRefreshed(data);
+      return data.access_token;
+    } catch {
+      return null;
+    } finally {
+      ongoingRefreshPromise = null;
+    }
+  })();
+
+  return ongoingRefreshPromise;
+}
+
+async function fetchWithAuth(
+  url: string,
+  token: string,
+  buildInit: (activeToken: string) => RequestInit
+): Promise<Response> {
+  const effectiveToken = latestAccessTokenOverride || token;
+  let res = await fetch(url, buildInit(effectiveToken));
+  if (res.status === 401) {
+    const newToken = await tryRefreshAccessToken();
+    if (newToken) {
+      res = await fetch(url, buildInit(newToken));
+    } else {
+      throw new Error('Tu sesión ha expirado. Por favor inicia sesión nuevamente.');
+    }
+  }
+  return res;
+}
+
 export const apiClient = {
   async checkServerHealth(): Promise<{
     ok: boolean;
@@ -237,15 +307,21 @@ export const apiClient = {
         format: ImageManipulator.SaveFormat.WEBP,
       }
     );
-    const formData = new FormData();
-    const frameFile = new File(lightFrame.uri);
-    formData.append('file', frameFile);
 
-    const res = await fetch(`${getApiBaseUrl()}/scans/evaluate-focus`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-      body: formData,
-    });
+    const res = await fetchWithAuth(
+      `${getApiBaseUrl()}/scans/evaluate-focus`,
+      token,
+      (activeToken) => {
+        const formData = new FormData();
+        const frameFile = new File(lightFrame.uri);
+        formData.append('file', frameFile);
+        return {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${activeToken}` },
+          body: formData,
+        };
+      }
+    );
     if (!res.ok) {
       throw new Error('Error evaluando enfoque del cuadro');
     }
@@ -261,28 +337,34 @@ export const apiClient = {
     asyncMode = false
   ): Promise<ScanItem> {
     const compressed = await compressToWebPClientSide(rawPhotoUri);
-    const formData = new FormData();
-    const webpFile = new File(compressed.uri);
-    formData.append('file', webpFile);
-    formData.append('force_capture', String(forceCapture));
-    if (asyncMode) {
-      formData.append('async_mode', 'true');
-    }
-    if (siiTedXml && siiTedXml.trim()) {
-      formData.append('sii_ted_xml', siiTedXml.trim());
-    }
-    if (
-      typeof precomputedBlurScore === 'number' &&
-      !Number.isNaN(precomputedBlurScore)
-    ) {
-      formData.append('precomputed_blur_score', String(precomputedBlurScore));
-    }
 
-    const res = await fetch(`${getApiBaseUrl()}/scans`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-      body: formData,
-    });
+    const res = await fetchWithAuth(
+      `${getApiBaseUrl()}/scans`,
+      token,
+      (activeToken) => {
+        const formData = new FormData();
+        const webpFile = new File(compressed.uri);
+        formData.append('file', webpFile);
+        formData.append('force_capture', String(forceCapture));
+        if (asyncMode) {
+          formData.append('async_mode', 'true');
+        }
+        if (siiTedXml && siiTedXml.trim()) {
+          formData.append('sii_ted_xml', siiTedXml.trim());
+        }
+        if (
+          typeof precomputedBlurScore === 'number' &&
+          !Number.isNaN(precomputedBlurScore)
+        ) {
+          formData.append('precomputed_blur_score', String(precomputedBlurScore));
+        }
+        return {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${activeToken}` },
+          body: formData,
+        };
+      }
+    );
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       const msg =
@@ -298,17 +380,25 @@ export const apiClient = {
   },
 
   async getScanStatus(token: string, scanId: string): Promise<ScanStatusItem> {
-    const res = await fetch(`${getApiBaseUrl()}/scans/${scanId}/status`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const res = await fetchWithAuth(
+      `${getApiBaseUrl()}/scans/${scanId}/status`,
+      token,
+      (activeToken) => ({
+        headers: { Authorization: `Bearer ${activeToken}` },
+      })
+    );
     if (!res.ok) throw new Error('Error al consultar estado del escaneo');
     return res.json();
   },
 
   async getScanDetail(token: string, scanId: string): Promise<ScanItem> {
-    const res = await fetch(`${getApiBaseUrl()}/scans/${scanId}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const res = await fetchWithAuth(
+      `${getApiBaseUrl()}/scans/${scanId}`,
+      token,
+      (activeToken) => ({
+        headers: { Authorization: `Bearer ${activeToken}` },
+      })
+    );
     if (!res.ok) throw new Error('Error al cargar detalle del escaneo');
     return res.json();
   },
@@ -327,9 +417,13 @@ export const apiClient = {
     if (params?.only_deleted) query.set('only_deleted', 'true');
     const qs = query.toString() ? `?${query.toString()}` : '';
 
-    const res = await fetch(`${getApiBaseUrl()}/scans${qs}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const res = await fetchWithAuth(
+      `${getApiBaseUrl()}/scans${qs}`,
+      token,
+      (activeToken) => ({
+        headers: { Authorization: `Bearer ${activeToken}` },
+      })
+    );
     if (!res.ok) throw new Error('Error cargando historial de escaneos');
     return res.json();
   },
@@ -340,17 +434,21 @@ export const apiClient = {
     normalizedData: NormalizedDocumentData,
     rawText?: string
   ): Promise<ScanItem> {
-    const res = await fetch(`${getApiBaseUrl()}/scans/${scanId}`, {
-      method: 'PUT',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        normalized_data: normalizedData,
-        raw_text: rawText,
-      }),
-    });
+    const res = await fetchWithAuth(
+      `${getApiBaseUrl()}/scans/${scanId}`,
+      token,
+      (activeToken) => ({
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${activeToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          normalized_data: normalizedData,
+          raw_text: rawText,
+        }),
+      })
+    );
     if (!res.ok) throw new Error('No se pudo guardar la nueva versión');
     return res.json();
   },
@@ -359,14 +457,18 @@ export const apiClient = {
     token: string,
     scanIds?: string[]
   ): Promise<void> {
-    const res = await fetch(`${getApiBaseUrl()}/scans/export-batch`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ scan_ids: scanIds || null }),
-    });
+    const res = await fetchWithAuth(
+      `${getApiBaseUrl()}/scans/export-batch`,
+      token,
+      (activeToken) => ({
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${activeToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ scan_ids: scanIds || null }),
+      })
+    );
     if (!res.ok) throw new Error('Error generando archivo Excel');
 
     const arrayBuffer = await res.arrayBuffer();
@@ -392,20 +494,28 @@ export const apiClient = {
     permanent = false
   ): Promise<void> {
     const qs = permanent ? '?permanent=true' : '';
-    const res = await fetch(`${getApiBaseUrl()}/scans/${scanId}${qs}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const res = await fetchWithAuth(
+      `${getApiBaseUrl()}/scans/${scanId}${qs}`,
+      token,
+      (activeToken) => ({
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${activeToken}` },
+      })
+    );
     if (!res.ok) {
       throw new Error('No se pudo eliminar el escaneo');
     }
   },
 
   async restoreScan(token: string, scanId: string): Promise<ScanItem> {
-    const res = await fetch(`${getApiBaseUrl()}/scans/${scanId}/restore`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const res = await fetchWithAuth(
+      `${getApiBaseUrl()}/scans/${scanId}/restore`,
+      token,
+      (activeToken) => ({
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeToken}` },
+      })
+    );
     if (!res.ok) {
       throw new Error('No se pudo restaurar el comprobante');
     }
@@ -417,14 +527,18 @@ export const apiClient = {
     scanIds: string[],
     permanent = false
   ): Promise<{ deleted_count: number; soft_deleted: boolean }> {
-    const res = await fetch(`${getApiBaseUrl()}/scans/delete-batch`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ scan_ids: scanIds, permanent }),
-    });
+    const res = await fetchWithAuth(
+      `${getApiBaseUrl()}/scans/delete-batch`,
+      token,
+      (activeToken) => ({
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${activeToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ scan_ids: scanIds, permanent }),
+      })
+    );
     if (!res.ok) {
       throw new Error('No se pudieron eliminar los escaneos seleccionados');
     }
@@ -435,14 +549,18 @@ export const apiClient = {
     token: string,
     scanIds: string[]
   ): Promise<{ restored_count: number }> {
-    const res = await fetch(`${getApiBaseUrl()}/scans/restore-batch`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ scan_ids: scanIds }),
-    });
+    const res = await fetchWithAuth(
+      `${getApiBaseUrl()}/scans/restore-batch`,
+      token,
+      (activeToken) => ({
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${activeToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ scan_ids: scanIds }),
+      })
+    );
     if (!res.ok) {
       throw new Error('No se pudieron restaurar los escaneos seleccionados');
     }

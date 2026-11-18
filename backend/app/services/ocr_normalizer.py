@@ -194,16 +194,19 @@ def extract_raw_text_from_image(
                 ocr_result, _ = _rapid_ocr_engine(enhanced_img)
                 if ocr_result:
                     reconstructed = _reconstruct_spatial_lines(ocr_result)
-                    # Si el pase completo no capturó el número de boleta/factura en el encabezado por curvatura o distancia,
-                    # hacer un zoom dedicado sobre el tercio superior central del documento
-                    if not re.search(
+                    non_empty_lines = [
+                        ln for ln in reconstructed.splitlines() if ln.strip()
+                    ]
+                    # Solo hacer zoom dedicado al encabezado si el pase general extrajo muy pocas líneas (< 5)
+                    # y empezando desde y=0 para no cortar a la mitad la primera línea del documento
+                    if len(non_empty_lines) < 5 and not re.search(
                         r"(?i)(?:[b38][o0]l(?:eta|\.)?\s*electr|factura\s*electr|f[o0]li[o0])\D{0,12}\d{4,14}",
                         reconstructed,
                     ):
                         h, w = enhanced_img.shape[:2]
                         header_crop = enhanced_img[
-                            int(h * 0.05) : int(h * 0.42),
-                            int(w * 0.14) : int(w * 0.86),
+                            0 : int(h * 0.40),
+                            int(w * 0.10) : int(w * 0.90),
                         ]
                         if header_crop.size > 0:
                             header_res, _ = _rapid_ocr_engine(header_crop)
@@ -495,22 +498,39 @@ def normalize_document_text(
     # 2. Extraer Fecha de emisión en formato ISO YYYY-MM-DD
     issue_date = parse_iso_date(clean_text)
 
-    # 3. Extraer RUTs validados en Módulo 11 (ignorando RUTs de procesadores de pago como Pluxee/JUNAEB para el emisor)
+    # 3. Extraer RUTs validados en Módulo 11 (ignorando RUTs de procesadores de pago y números de TERMINAL POS)
     normalized_ruts: list[str] = []
     footer_payment_ruts: set[str] = set()
+    customer_particular_ruts: set[str] = set()
 
-    for line in lines:
+    for idx_l, line in enumerate(lines):
         upper_l = line.upper()
+        # Ignorar líneas de números de terminal POS u operación bancaria que parecen RUT (ej. TERMINAL 30000514-2)
+        if any(
+            pos_k in upper_l
+            for pos_k in ("TERMINAL", "OPERACION", "AUTORIZACION", "TARJETA", "TICKET")
+        ) and "R.U.T" not in upper_l and "RUT" not in upper_l:
+            continue
+
         line_ruts = re.findall(
             r"(?i)R\.?U\.?T\.?\s*(?:RECEPTOR|EMISOR)?\s*[:.]?\s*(\d{1,2}\.?\d{3}\.?\d{3}-?[\dkK]|\d{7,8}-?[\dkK])",
             line,
         ) + re.findall(
             r"\b(?:\d{1,2}\.?\d{3}\.?\d{3}|\d{7,8})-[\dkK]\b", line
         )
+        next_line_upper = lines[idx_l + 1].upper() if idx_l + 1 < len(lines) else ""
+        is_particular_context = (
+            "PARTICULAR" in upper_l
+            or "PARTICULAR" in next_line_upper
+            or "RECEPTOR" in upper_l
+            or "CLIENTE" in upper_l
+        )
         for cand in line_ruts:
             fmt = format_rut(cand)
             if any(pk in upper_l for pk in PAYMENT_PROCESSOR_KEYWORDS):
                 footer_payment_ruts.add(fmt)
+            if is_particular_context:
+                customer_particular_ruts.add(fmt)
             if fmt not in normalized_ruts and validate_rut_mod11(fmt):
                 normalized_ruts.append(fmt)
 
@@ -518,8 +538,6 @@ def normalize_document_text(
         all_cands = re.findall(
             r"(?i)R\.?U\.?T\.?\s*(?:RECEPTOR|EMISOR)?\s*[:.]?\s*(\d{1,2}\.?\d{3}\.?\d{3}-?[\dkK]|\d{7,8}-?[\dkK])",
             clean_text,
-        ) + re.findall(
-            r"\b(?:\d{1,2}\.?\d{3}\.?\d{3}|\d{7,8})-[\dkK]\b", clean_text
         )
         for cand in all_cands:
             fmt = format_rut(cand)
@@ -529,8 +547,14 @@ def normalize_document_text(
     non_payment_ruts = [r for r in normalized_ruts if r not in footer_payment_ruts]
     primary_ruts = non_payment_ruts if non_payment_ruts else normalized_ruts
 
-    issuer_rut = primary_ruts[0] if len(primary_ruts) >= 1 else ""
-    receiver_rut = primary_ruts[1] if len(primary_ruts) >= 2 else ""
+    corporate_ruts = [r for r in primary_ruts if r not in customer_particular_ruts]
+    if corporate_ruts:
+        issuer_rut = corporate_ruts[0]
+        remaining_ruts = [r for r in primary_ruts if r != issuer_rut]
+        receiver_rut = remaining_ruts[0] if remaining_ruts else ""
+    else:
+        issuer_rut = ""
+        receiver_rut = primary_ruts[0] if primary_ruts else ""
 
     # 4. Extraer Razón Social (Comercio) y Dirección del Emisor y Receptor
     issuer_name = ""
@@ -548,6 +572,10 @@ def normalize_document_text(
         "RETAIL",
         "SERVICIOS",
         "SUPERMERCADO",
+        "RESTAURANTE",
+        "RESTAURANT",
+        "FACTORY",
+        "FARMACIA",
         "HIPER",
         "DECATHLON",
         "CENCOSUD",
@@ -567,10 +595,10 @@ def normalize_document_text(
 
         if not receiver_name and any(
             k in upper_l
-            for k in ("SEÑOR(ES)", "SENOR(ES)", "CLIENTE:", "RECEPTOR:", "NOMBRE:")
+            for k in ("SEÑOR(ES)", "SENOR(ES)", "SENOR(E)", "CLIENTE:", "RECEPTOR:", "NOMBRE:")
         ):
             parts = re.split(
-                r"(?i)(?:señor\(es\)|senor\(es\)|cliente|receptor|nombre)\s*:\s*",
+                r"(?i)(?:señor\(es\)|senor\(es\)|senor\(e\)|cliente|receptor|nombre)\s*:?\s*",
                 line,
             )
             if len(parts) > 1 and parts[1].strip():
@@ -586,6 +614,7 @@ def normalize_document_text(
                 "DIRECCIÓN",
                 "SUC:",
                 "SUC.:",
+                "SUCURSAL:",
                 "AV ",
                 "AV.",
                 "AVENIDA",
@@ -604,8 +633,8 @@ def normalize_document_text(
                 )
             issuer_address = addr_line.strip(" -–—:.,")
 
-        # Buscar el comercio emisor en el encabezado (primeras 10 líneas) incluso si comparte línea con el RUT
-        if not issuer_name and idx < 10:
+        # Buscar el comercio emisor en las primeras 25 líneas (incluyendo bloque de voucher POS si el encabezado fue doblado)
+        if not issuer_name and idx < 25:
             candidate = _clean_candidate_issuer_line(line)
             cand_upper = normalize_ocr_confusions_in_keywords(candidate)
             if (
@@ -613,7 +642,7 @@ def normalize_document_text(
                 and any(suffix in cand_upper for suffix in corporate_suffixes)
                 and not any(
                     k in cand_upper
-                    for k in ("SEÑOR", "CLIENTE", "GIRO", "PUNTOS", "SII SANTIAGO")
+                    for k in ("SEÑOR", "SENOR", "CLIENTE", "GIRO", "PUNTOS", "SII SANTIAGO")
                 )
             ):
                 issuer_name = candidate
@@ -628,7 +657,7 @@ def normalize_document_text(
             if (
                 len(cand) >= 4
                 and not re.search(
-                    r"(?i)(rut|factura|boleta|[b38]ol\.|folio|fecha|sii\s+santiago|sii\s+saniago|suc:|av\.|avenida)",
+                    r"(?i)(rut|factura|boleta|[b38]ol\.|folio|fecha|sii\s+santiago|sii\s+saniago|suc:|sucursal|av\.|av\s|avenida|garzon|articulo|subtotal|total|iva)",
                     cand,
                 )
             ):

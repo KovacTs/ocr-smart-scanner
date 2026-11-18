@@ -373,7 +373,7 @@ export const HistoryScreen: React.FC<Props> = ({
           placeholderTextColor="#64748B"
           value={search}
           onChangeText={setSearch}
-          onSubmitEditing={fetchScans}
+          onSubmitEditing={() => fetchScans(false)}
           returnKeyType="search"
         />
       </View>

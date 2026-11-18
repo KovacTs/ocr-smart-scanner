@@ -182,9 +182,9 @@ def _call_gemini_api(
         )
         return None
 
-    candidate_models = [settings.GEMINI_MODEL]
-    if "gemini-flash-lite-latest" not in candidate_models:
-        candidate_models.append("gemini-flash-lite-latest")
+    candidate_models: list[str] = ["gemini-flash-lite-latest"]
+    if settings.GEMINI_MODEL and settings.GEMINI_MODEL not in candidate_models:
+        candidate_models.append(settings.GEMINI_MODEL)
 
     parts: list[dict[str, Any]] = [
         {
@@ -195,7 +195,9 @@ def _call_gemini_api(
         }
     ]
 
-    if image_path and os.path.exists(image_path):
+    non_empty_lines = [ln for ln in raw_text.splitlines() if ln.strip()]
+    # Solo adjuntar imagen base64 si el OCR visual extrajo menos de 6 líneas (ahorra ~1.5s de red)
+    if len(non_empty_lines) < 6 and image_path and os.path.exists(image_path):
         try:
             with open(image_path, "rb") as f:
                 img_b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -223,8 +225,8 @@ def _call_gemini_api(
         },
     }
 
-    read_timeout = min(float(settings.LLM_TIMEOUT_SECONDS), 2.8)
-    timeout = httpx.Timeout(read_timeout, connect=1.5)
+    read_timeout = max(float(settings.LLM_TIMEOUT_SECONDS), 4.5)
+    timeout = httpx.Timeout(read_timeout, connect=1.8)
     with httpx.Client(timeout=timeout) as client:
         for model_name in candidate_models:
             url = (
@@ -258,16 +260,15 @@ def _call_gemini_api(
                     return parsed
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as net_err:
                 logger.warning(
-                    f"⚠️ [LLM Gemini] Timeout/Red ({type(net_err).__name__}). Activando circuit-breaker 60s y usando OCR heurístico."
+                    f"⚠️ [LLM Gemini] Timeout/Red en {model_name} ({type(net_err).__name__})."
                 )
-                _gemini_cooldown_until = time.monotonic() + 60.0
-                break
+                continue
             except Exception as err:
                 logger.warning(f"⚠️ [LLM Gemini] Error invocando {model_name}: {err}")
-                break
+                continue
 
     if time.monotonic() >= _gemini_cooldown_until:
-        _gemini_cooldown_until = time.monotonic() + 60.0
+        _gemini_cooldown_until = time.monotonic() + 30.0
     return None
 
 
@@ -371,12 +372,20 @@ def sanitize_and_merge_llm_output(
     llm_name = str(llm_issuer.get("legal_name") or "").strip()
     if (
         llm_name
-        and llm_name.upper() != "EMISOR NO IDENTIFICADO"
+        and len(llm_name) >= 3
+        and llm_name.upper() not in ("EMISOR NO IDENTIFICADO", "S/N", "N/A", "NONE", "NULL", "DESCONOCIDO")
         and not any(pk in llm_name.upper() for pk in PAYMENT_PROCESSOR_KEYWORDS)
     ):
+        cur_name_upper = str(cur_issuer.get("legal_name") or "").upper()
+        has_corp_marker = any(
+            m in cur_name_upper
+            for m in ("S.A", "SPA", "LTDA", "LIMITADA", "EIRL", "E.I.R.L", "RETAIL", "SUPERMERCADO", "FACTORY", "RESTAURANTE")
+        )
         if (
-            not cur_issuer.get("legal_name")
-            or cur_issuer["legal_name"] == "EMISOR NO IDENTIFICADO"
+            not cur_name_upper
+            or cur_name_upper == "EMISOR NO IDENTIFICADO"
+            or not has_corp_marker
+            or len(cur_name_upper) > 60
         ):
             cur_issuer["legal_name"] = llm_name
 
